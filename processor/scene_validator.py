@@ -1,7 +1,9 @@
+import os
 import json
-from typing import List, Dict, Any, Tuple, Optional, Callable
-from llama_cpp import Llama as NativeLlama
+from typing import List, Optional, Callable
+
 from processor.llm_engine import NativeLlamaEngine
+
 
 class SceneValidator:
     """
@@ -11,14 +13,33 @@ class SceneValidator:
     def __init__(self, engine: NativeLlamaEngine):
         self.engine = engine
 
-    def validate_boundaries(self, scenes: List[str], on_boundary_checked: Optional[Callable] = None, on_scene_ready: Optional[Callable] = None) -> List[str]:
+    def validate_boundaries(
+        self,
+        scenes: List[str],
+        on_boundary_checked: Optional[Callable] = None,
+        on_scene_ready: Optional[Callable] = None,
+        log_dir: Optional[str] = None,
+        max_tokens: int = 0,
+        min_tokens: int = 128,
+        tokenizer: Optional[Callable[[str], int]] = None,
+    ) -> List[str]:
+        """
+        Args:
+            max_tokens: 單一場景的 token 上限。超過就強制切斷，不問 LLM。0 = 不限制。
+            min_tokens: 小於此值的碎片會被合併到前一個場景。0 = 不清理。
+            tokenizer: 計算 token 數的 callback，例如 lambda text: len(engine.tokenize(text))
+        """
         # 移除空值或純空白的片段
         scenes = [s for s in scenes if s.strip()]
-        
+
         if len(scenes) <= 1:
             if on_scene_ready and len(scenes) == 1:
                 on_scene_ready(1, scenes[0])
             return scenes
+
+        # 準備 log 目錄
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
 
         validated_scenes: List[str] = []
         current_scene = scenes[0]
@@ -26,20 +47,50 @@ class SceneValidator:
 
         for i in range(1, len(scenes)):
             next_scene = scenes[i]
+
+            # --- Token 上限硬切 ---
+            if max_tokens > 0 and tokenizer:
+                merged_tokens = tokenizer(current_scene + "\n" + next_scene)
+                if merged_tokens > max_tokens:
+                    # 超過上限，強制切斷，跳過 LLM 判斷
+                    validated_scenes.append(current_scene)
+                    if on_scene_ready:
+                        on_scene_ready(len(validated_scenes), current_scene)
+                    current_scene = next_scene
+
+                    if log_dir:
+                        log_entry = {
+                            "boundary": f"{i}/{total_boundaries}",
+                            "decision": "FORCE_SPLIT",
+                            "reason": f"merged_tokens={merged_tokens} > max_tokens={max_tokens}",
+                        }
+                        log_path = os.path.join(log_dir, f"boundary_{i:03d}.json")
+                        with open(log_path, "w", encoding="utf-8") as f:
+                            json.dump(log_entry, f, ensure_ascii=False, indent=2)
+
+                    if on_boundary_checked:
+                        on_boundary_checked(i, total_boundaries, len(validated_scenes) + 1, f"FORCE_SPLIT ({merged_tokens}>{max_tokens})")
+                    continue
+
+            # --- LLM 判斷 ---
             s1_end = current_scene[-400:] if len(current_scene) > 400 else current_scene
             s2_begin = next_scene[:400] if len(next_scene) > 400 else next_scene
 
             messages = [
                 {"role": "system", "content": (
-                    "你是專業的小說結構分析師。你的任務是判斷兩段文字是否屬於同一個「敘事段落」。\n"
-                    "以下任一條件成立，就應該分開（combine: false）：\n"
-                    "- 時間跳躍（即使很短，如「過了一會」「隔天」）\n"
-                    "- 地點轉換\n"
-                    "- 視角或焦點人物切換\n"
-                    "- 話題或事件焦點明顯改變（例如從戰鬥轉為對話、從行動轉為回憶）\n"
-                    "- 情緒或敘事節奏出現轉折（例如從緊張轉為平靜）\n"
-                    "- 出現分隔符號（如 ＊＊＊、───、空行分段）\n"
-                    "只有當兩段文字在描述完全相同的連續場景、沒有任何上述轉折時，才合併。\n"
+                    "你是小說結構分析師。判斷兩段文字是否應該合併為同一個場景段落。\n\n"
+                    "【應該分開的情況】（任一成立 → combine: false）：\n"
+                    "- 明確的時空跳轉（「隔天」「回到家後」「三天前」等）\n"
+                    "- 地點發生實質轉移（從室內到室外、從A城到B城）\n"
+                    "- 敘事視角切換到完全不同的角色\n"
+                    "- 出現作者設置的分隔符號（◆、＊＊＊、───、空行分段等）\n\n"
+                    "【應該合併的情況】（以下不算轉折 → combine: true）：\n"
+                    "- 同一段對話的自然延續（即使話題在對話中推進）\n"
+                    "- 同一場景內的情緒升級或降級（緊張→更緊張、生氣→妥協）\n"
+                    "- 同一地點的連續觀察與行動（看到A→又看到B）\n"
+                    "- 從行動描寫到角色內心旁白的切換\n"
+                    "- 同一事件的因果推進（拒絕→提出替代方案→討論方案）\n\n"
+                    "判斷原則：根據上述條件客觀判斷。如果不確定，保持分開。\n"
                     "只輸出 JSON，不要附加說明。"
                 )},
                 {"role": "user", "content": (
@@ -60,18 +111,52 @@ class SceneValidator:
                 should_combine = "true" in raw_text.lower() if "combine" in raw_text.lower() else True
                 thought = "Parse Error"
 
+            # --- Debug Log ---
+            if log_dir:
+                log_entry = {
+                    "boundary": f"{i}/{total_boundaries}",
+                    "prompt": {
+                        "system": messages[0]["content"],
+                        "user": messages[1]["content"],
+                    },
+                    "response": {
+                        "raw": raw_text,
+                        "thought": thought,
+                        "parsed_result": should_combine,
+                    },
+                }
+                log_path = os.path.join(log_dir, f"boundary_{i:03d}.json")
+                with open(log_path, "w", encoding="utf-8") as f:
+                    json.dump(log_entry, f, ensure_ascii=False, indent=2)
+
             if should_combine:
                 current_scene = current_scene + "\n" + next_scene
             else:
                 validated_scenes.append(current_scene)
-                if on_scene_ready:
-                    on_scene_ready(len(validated_scenes), current_scene)
                 current_scene = next_scene
 
             if on_boundary_checked:
                 on_boundary_checked(i, total_boundaries, len(validated_scenes) + 1, thought[:50] if thought else "No COT")
 
         validated_scenes.append(current_scene)
+
+        # --- 碎片清理：小於 min_tokens 的 scene 合併到前一個 ---
+        if min_tokens > 0 and tokenizer and len(validated_scenes) > 1:
+            merged: List[str] = [validated_scenes[0]]
+            for scene in validated_scenes[1:]:
+                if tokenizer(scene) < min_tokens:
+                    merged[-1] = merged[-1] + "\n" + scene
+                else:
+                    merged.append(scene)
+            # 第一個 scene 如果也太小，合併到下一個
+            if len(merged) > 1 and tokenizer(merged[0]) < min_tokens:
+                merged[1] = merged[0] + "\n" + merged[1]
+                merged.pop(0)
+            validated_scenes = merged
+
+        # 通知最終結果
         if on_scene_ready:
-            on_scene_ready(len(validated_scenes), current_scene)
+            for idx, scene in enumerate(validated_scenes, 1):
+                on_scene_ready(idx, scene)
+
         return validated_scenes

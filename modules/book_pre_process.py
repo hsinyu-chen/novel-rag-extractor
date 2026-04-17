@@ -14,6 +14,29 @@ from processor.llm_engine import NativeLlamaEngine
 from processor.scene_validator import SceneValidator
 from processor.scene_summarizer import SceneSummarizer
 
+# ── 結構性分隔符 regex（語義分詞前的硬切） ──
+# 匹配順序：章節標題 > 裝飾分隔符 > 線段分隔符 > 連續空行
+_STRUCTURAL_BREAK = re.compile(
+    r"(?:"
+    # 1. 中文章節標題：第X卷、第X章、第X節、第X話、第X回（前後有換行）
+    r"(?=\n\s*第\s*?[一二三四五六七八九十百千\d]+\s*?[卷章節話回篇]\b)"
+    r"|"
+    # 2. 英文章節標題：Chapter X, Prologue, Epilogue
+    r"(?=\n\s*(?:chapter|prologue|epilogue)\s)"
+    r"|"
+    # 3. 裝飾分隔符：◆ ◇ ★ ☆ ■ □ ● ○ ※ ＊ *（含全形）可重複
+    r"(?=\n\s*[◆◇★☆■□●○※＊\*]{1,}\s*\n)"
+    r"|"
+    # 4. 線段分隔符：--- === ─── ━━━ ＝＝＝（3個以上）
+    r"(?=\n\s*[-=─━＝]{3,}\s*\n)"
+    r"|"
+    # 5. 連續 3+ 空行
+    r"(?=\n{3,})"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 class BookPreProcessor:
     """
     小說預處理引擎
@@ -59,22 +82,38 @@ class BookPreProcessor:
             buffer_size=3
         )
 
+    @staticmethod
+    def _structural_presplit(text: str) -> List[str]:
+        """在語義分詞之前，先用 regex 硬切章節/分隔符邊界。"""
+        sections = _STRUCTURAL_BREAK.split(text)
+        return [s for s in sections if s.strip()]
+
     def _split_step(self, text: str, config: RunnableConfig) -> List[str]:
-        """LCEL Step 1: 語義切分"""
+        """LCEL Step 1: 結構硬切 → 語義切分"""
         params = config.get("configurable", {})
         progress = params.get("progress")
         file_task = params.get("file_task")
         filename = params.get("filename")
 
         if progress and file_task:
-            progress.update(file_task, description=f"[cyan]Semantic Splitting {filename}...", completed=20)
-        
-        initial_scenes = [s for s in self.chunker.split_text(text) if s.strip()]
-        
+            progress.update(file_task, description=f"[cyan]Structural Pre-split {filename}...", completed=10)
+
+        # Phase 1: 結構性硬切（章節、分隔符、連續空行）
+        sections = self._structural_presplit(text)
+
+        if progress and file_task:
+            progress.update(file_task, description=f"[cyan]Semantic Splitting {filename} ({len(sections)} sections)...", completed=20)
+
+        # Phase 2: 每個 section 內部做語義分詞
+        all_chunks: List[str] = []
+        for section in sections:
+            chunks = [s for s in self.chunker.split_text(section) if s.strip()]
+            all_chunks.extend(chunks)
+
         if progress and file_task:
             progress.update(file_task, completed=40)
-            
-        return initial_scenes
+
+        return all_chunks
 
     def _validate_step(self, initial_scenes: List[str], config: RunnableConfig) -> List[str]:
         """LCEL Step 2: 場景邊界驗證"""
@@ -110,10 +149,14 @@ class BookPreProcessor:
             })
 
         # 執行驗證 (在此階段進行中間存檔)
+        log_dir = os.path.join("output", novel_hash, "logs", "validate", f"vol_{vol_num}")
         final_scenes = self.validator.validate_boundaries(
             initial_scenes, 
             on_boundary_checked=on_boundary, 
-            on_scene_ready=on_pre_save
+            on_scene_ready=on_pre_save,
+            log_dir=log_dir,
+            max_tokens=4096,
+            tokenizer=self.count_tokens,
         )
         
         return final_scenes
@@ -156,7 +199,6 @@ class BookPreProcessor:
             self.storage.set(key, {
                 "novel": novel_name, "volume": vol_num, "scene_index": scene_idx,
                 "token_count": token_count, "title": summary,
-                "summary_thought": thought,
                 "content": content, "status": "segmented"
             })
 
@@ -176,17 +218,29 @@ class BookPreProcessor:
         match = re.search(r'(\d+)', filename)
         return int(match.group(1)) if match else 0
 
-    def run(self, novel_name: str, start_vol: int):
+    def run(self, novel_name: str, start_vol: int, end_vol: int = 0, clean_output: bool = False):
         base_data_path = os.path.join("data", novel_name)
         if not os.path.exists(base_data_path):
             self.console.print(f"[red]Error: 找不到小說資料夾 {base_data_path}[/red]")
             return
         
         novel_hash = self.get_path_hash(base_data_path)
+
+        # --clean: 清除該小說的全部輸出
+        if clean_output:
+            import shutil
+            output_dir = os.path.join("output", novel_hash)
+            if os.path.exists(output_dir):
+                shutil.rmtree(output_dir)
+                self.console.print(f"[yellow]已清除輸出目錄: {output_dir}[/yellow]")
+
         self.console.print(f"\n[bold magenta]>> 開始預處理: {novel_name}[/bold magenta] (Hash: {novel_hash})")
 
         all_files = [f for f in os.listdir(base_data_path) if f.endswith(".txt")]
         target_files = sorted([(self.get_numeric_value(f), f) for f in all_files if self.get_numeric_value(f) >= start_vol])
+        # --vol: 只跑指定的單一集數
+        if end_vol > 0:
+            target_files = [(n, f) for n, f in target_files if n <= end_vol]
 
         with Progress(
             SpinnerColumn(), TextColumn("[progress.description]{task.description}"),

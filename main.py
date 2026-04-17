@@ -27,6 +27,8 @@ def main():
     parser = argparse.ArgumentParser(description="Narrative RAG Pipeline Entry Point")
     parser.add_argument("--novel", type=str, required=True, help="小說資料夾名稱")
     parser.add_argument("--start", type=int, default=1, help="起始集數數字")
+    parser.add_argument("--vol", type=int, default=0, help="只跑指定的單一集數")
+    parser.add_argument("--clean", action="store_true", help="清除該小說的全部輸出後重跑")
     parser.add_argument("--mode", type=str, default="ingest", choices=["ingest", "process", "all"])
     args = parser.parse_args()
 
@@ -44,7 +46,9 @@ def main():
         print(f"\n[Mode: Ingest] Starting pre-processing for {args.novel}...")
         # 從容器中解析出 pre_processor，所有依賴會自動注入
         pre_processor = container.pre_processor()
-        pre_processor.run(args.novel, args.start)
+        start = args.vol if args.vol else args.start
+        end = args.vol if args.vol else 0
+        pre_processor.run(args.novel, start, end_vol=end, clean_output=args.clean)
     
     if args.mode in ["process", "all"]:
         print("\n[Mode: Process] Agent Analysis logic coming soon...")
