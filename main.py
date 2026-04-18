@@ -1,28 +1,20 @@
 import os
 import argparse
-import llama_cpp
-import ctypes
-
-# 官方方式：攔截 C++ 層級的所有日誌
-# 定義一個空的回調函數
-@ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p)
-def llama_log_callback(level, text, user_data):
-    pass
-
-# 在任何推理開始前註冊回調
-llama_cpp.llama_log_set(llama_log_callback, None)
-
-os.environ["GGML_PYTHON_LOG_LEVEL"] = "ERROR"
-
 from dataclasses import asdict
 from core.config import ConfigService
 from core.container import AppContainer
+from pre_check import run_pre_requirements
 
 def main():
     """
     程式進入點
-    流程：組建配置 -> 註冊服務 -> 解析對象 -> 執行業務
+    流程：Pre-check -> 組建配置 -> 註冊服務 -> 解析對象 -> 執行業務
     """
+    # 0. 執行系統 Pre-check (失敗則退出)
+    if not run_pre_requirements():
+        print("[Error] System pre-check failed. Please check your servers and .env configuration.")
+        return
+        
     # 1. 解析命令列參數
     parser = argparse.ArgumentParser(description="Narrative RAG Pipeline Entry Point")
     parser.add_argument("--novel", type=str, required=True, help="小說資料夾名稱")
@@ -51,7 +43,11 @@ def main():
         pre_processor.run(args.novel, start, end_vol=end, clean_output=args.clean)
     
     if args.mode in ["process", "all"]:
-        print("\n[Mode: Process] Agent Analysis logic coming soon...")
+        print(f"\n[Mode: Process] Starting knowledge extraction agent for {args.novel}...")
+        knowledge_processor = container.knowledge_processor()
+        start = args.vol if args.vol else args.start
+        end = args.vol if args.vol else 0
+        knowledge_processor.run(args.novel, start, end_vol=end, clean_output=args.clean)
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,7 @@
 import weaviate
 import logging
 import sys
+import os
 
 logging.basicConfig(level=logging.INFO)
 
@@ -11,20 +12,24 @@ def test_weaviate_v4():
         # Assuming 443 for REST and 50051 for gRPC
         # We'll try common variations
         
+        host = os.getenv("WEAVIATE_HOST", "localhost")
+        h_port = int(os.getenv("WEAVIATE_HTTP_PORT", 8080))
+        h_secure = os.getenv("WEAVIATE_HTTP_SECURE", "False").lower() == "true"
+        g_port = int(os.getenv("WEAVIATE_GRPC_PORT", 50051))
+        g_secure = os.getenv("WEAVIATE_GRPC_SECURE", "False").lower() == "true"
+        
         configs = [
-            {"name": "HTTP:443, gRPC:50051 (Secure HTTP, Insecure gRPC)", "http_port": 443, "http_secure": True, "grpc_port": 50051, "grpc_secure": False},
-            {"name": "HTTP:443, gRPC:443 (All Secure/Combined)", "http_port": 443, "http_secure": True, "grpc_port": 443, "grpc_secure": True},
-            {"name": "HTTP:80, gRPC:50051 (All Insecure)", "http_port": 80, "http_secure": False, "grpc_port": 50051, "grpc_secure": False},
+            {"name": "Env Config", "http_port": h_port, "http_secure": h_secure, "grpc_port": g_port, "grpc_secure": g_secure},
         ]
         
         for config in configs:
-            print(f"\n--- Trying Config: {config['name']} ---")
+            print(f"\n--- Trying Config: {config['name']} ({host}:{config['http_port']}) ---")
             client = weaviate.WeaviateClient(
                 connection_params=weaviate.connect.ConnectionParams.from_params(
-                    http_host="weaviate.dynameis.app",
+                    http_host=host,
                     http_port=config["http_port"],
                     http_secure=config["http_secure"],
-                    grpc_host="weaviate.dynameis.app",
+                    grpc_host=host,
                     grpc_port=config["grpc_port"],
                     grpc_secure=config["grpc_secure"],
                 )

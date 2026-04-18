@@ -75,23 +75,21 @@ class SceneValidator:
             # --- LLM 判斷 ---
             s1_end = current_scene[-400:] if len(current_scene) > 400 else current_scene
             s2_begin = next_scene[:400] if len(next_scene) > 400 else next_scene
+            
+            # 使用 JSON Schema 確保邊界判斷格式
+            schema = {
+                "type": "object",
+                "properties": {
+                    "combine": {"type": "boolean"}
+                },
+                "required": ["combine"],
+                "additionalProperties": False
+            }
 
             messages = [
                 {"role": "system", "content": (
-                    "你是小說結構分析師。判斷兩段文字是否應該合併為同一個場景段落。\n\n"
-                    "【應該分開的情況】（任一成立 → combine: false）：\n"
-                    "- 明確的時空跳轉（「隔天」「回到家後」「三天前」等）\n"
-                    "- 地點發生實質轉移（從室內到室外、從A城到B城）\n"
-                    "- 敘事視角切換到完全不同的角色\n"
-                    "- 出現作者設置的分隔符號（◆、＊＊＊、───、空行分段等）\n\n"
-                    "【應該合併的情況】（以下不算轉折 → combine: true）：\n"
-                    "- 同一段對話的自然延續（即使話題在對話中推進）\n"
-                    "- 同一場景內的情緒升級或降級（緊張→更緊張、生氣→妥協）\n"
-                    "- 同一地點的連續觀察與行動（看到A→又看到B）\n"
-                    "- 從行動描寫到角色內心旁白的切換\n"
-                    "- 同一事件的因果推進（拒絕→提出替代方案→討論方案）\n\n"
-                    "判斷原則：根據上述條件客觀判斷。如果不確定，保持分開。\n"
-                    "只輸出 JSON，不要附加說明。"
+                    "你是小說結構分析師。判斷兩段文字是否應該合併為同一個場景段落。\n"
+                    "請嚴格根據敘事連貫性進行判定。"
                 )},
                 {"role": "user", "content": (
                     f"【片段 1 結尾】：\n{s1_end}\n\n"
@@ -100,16 +98,15 @@ class SceneValidator:
                 )}
             ]
 
-            raw_text = self.engine.call_llm(messages)
+            thought, json_str = self.engine.call_llm(messages, response_schema=schema)
 
             # --- 解析結果 ---
             try:
-                thought, json_str = self.engine.parse_response(raw_text)
                 data = json.loads(json_str)
                 should_combine = data.get("combine", True)
             except Exception:
-                should_combine = "true" in raw_text.lower() if "combine" in raw_text.lower() else True
-                thought = "Parse Error"
+                should_combine = "true" in json_str.lower() if "combine" in json_str.lower() else True
+                thought = thought or "Parse Error"
 
             # --- Debug Log ---
             if log_dir:
@@ -120,8 +117,8 @@ class SceneValidator:
                         "user": messages[1]["content"],
                     },
                     "response": {
-                        "raw": raw_text,
                         "thought": thought,
+                        "json_str": json_str,
                         "parsed_result": should_combine,
                     },
                 }

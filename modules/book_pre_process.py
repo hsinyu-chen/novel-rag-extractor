@@ -3,14 +3,13 @@ import re
 import hashlib
 import json
 from typing import List, Dict, Any
-from llama_cpp import Llama
-from huggingface_hub import hf_hub_download
 from langchain_core.runnables import RunnableLambda, RunnableConfig
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 from rich.console import Console
 
 from core.config import PipelineConfig
 from processor.llm_engine import NativeLlamaEngine
+from processor.embed_engine import LlamaSimpleEmbeddings
 from processor.scene_validator import SceneValidator
 from processor.scene_summarizer import SceneSummarizer
 
@@ -41,13 +40,13 @@ class BookPreProcessor:
     """
     小說預處理引擎
     """
-    def __init__(self, storage, validator: SceneValidator, summarizer: SceneSummarizer, config: Any):
+    def __init__(self, storage, embed_engine: LlamaSimpleEmbeddings, validator: SceneValidator, summarizer: SceneSummarizer, config: Any):
         self.storage = storage
+        self.embed_engine = embed_engine
         self.validator = validator
         self.summarizer = summarizer
         self.conf = config
-        self.n_ctx = int(self.conf["n_ctx"])
-        self.n_gpu_layers = int(self.conf["n_gpu_layers"])
+        self.n_ctx = 8192
         self.console = Console()
 
         # 1. 初始化模型
@@ -64,18 +63,11 @@ class BookPreProcessor:
         self.console.print("[bold green] Pre-processor initialized.[/bold green]")
 
     def _init_models(self):
-        # Embedding (TODO: Could also be moved to DI Container)
-        embed_path = hf_hub_download(repo_id=self.conf["embed_model_repo"], filename=self.conf["embed_model_file"])
-        self.embed_engine = Llama(model_path=embed_path, n_gpu_layers=self.n_gpu_layers, n_ctx=int(self.conf["embed_n_ctx"]), embedding=True, verbose=False)
-        
-        class LlamaSimpleEmbeddings:
-            def __init__(self, engine): self.engine = engine
-            def embed_documents(self, t): return [self.engine.create_embedding(i)["data"][0]["embedding"] for i in t]
-            def embed_query(self, t): return self.engine.create_embedding(t)["data"][0]["embedding"]
+        # Embedding engine is now passed via Dependency Injection (container.py)
         
         from langchain_experimental.text_splitter import SemanticChunker
         self.chunker = SemanticChunker(
-            LlamaSimpleEmbeddings(self.embed_engine),
+            self.embed_engine,
             sentence_split_regex=r"(?<=[。！？\n\n])",
             breakpoint_threshold_type="percentile",
             breakpoint_threshold_amount=99,
@@ -209,7 +201,7 @@ class BookPreProcessor:
         return final_scenes
 
     def count_tokens(self, text: str) -> int:
-        return len(self.embed_engine.tokenize(text.encode("utf-8"), add_bos=False))
+        return self.embed_engine.tokenize(text)
 
     def get_path_hash(self, path: str) -> str:
         return hashlib.md5(os.path.abspath(path).encode('utf-8')).hexdigest()[:8]

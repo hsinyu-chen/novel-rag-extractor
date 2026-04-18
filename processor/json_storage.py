@@ -65,6 +65,22 @@ class JsonStorage(BaseStorage):
                 keys.append(f"{prefix}.{f[:-5]}")
         return sorted(keys)
 
+    def list_namespaces(self, prefix: str) -> List[str]:
+        """
+        列出特定目錄下的所有子目錄 (Namespaces)
+        """
+        parts = prefix.split('.')
+        target_dir = os.path.join(self.base_dir, *parts)
+        
+        if not os.path.exists(target_dir):
+            return []
+            
+        namespaces = []
+        for f in os.listdir(target_dir):
+            if os.path.isdir(os.path.join(target_dir, f)):
+                namespaces.append(f"{prefix}.{f}")
+        return sorted(namespaces)
+
     def get_history_summary(self, limit: int = 5) -> str:
         """
         獲取最近場景的簡短語義回顧 (掃描 scenes 目錄)

@@ -4,16 +4,20 @@ from dotenv import load_dotenv
 
 @dataclass
 class PipelineConfig:
-    embed_model_repo: str
-    embed_model_file: str
-    embed_n_ctx: int
-    summary_model_repo: str
-    summary_model_file: str
+    embed_base_url: str
+    embed_api_key: str
+    embed_model: str
+    summary_base_url: str
+    summary_api_key: str
+    summary_model: str
     summary_temp: float
     summary_top_p: float
     summary_top_k: int
-    n_ctx: int
-    n_gpu_layers: int
+    weaviate_host: str
+    weaviate_http_port: int
+    weaviate_http_secure: bool
+    weaviate_grpc_port: int
+    weaviate_grpc_secure: bool
 
 class ConfigService:
     """
@@ -29,14 +33,21 @@ class ConfigService:
         從環境變數組裝 PipelineConfig 物件
         """
         return PipelineConfig(
-            embed_model_repo=os.getenv("EMBED_MODEL_REPO", "phate334/multilingual-e5-large-gguf"),
-            embed_model_file=os.getenv("EMBED_MODEL_FILE", "multilingual-e5-large-f16.gguf"),
-            embed_n_ctx=int(os.getenv("EMBED_N_CTX", 512)),
-            summary_model_repo=os.getenv("SUMMARY_MODEL_REPO", "unsloth/gemma-4-E4B-it-GGUF"),
-            summary_model_file=os.getenv("SUMMARY_MODEL_FILE", "gemma-4-E4B-it-Q4_K_M.gguf"),
+            embed_base_url=os.getenv("EMBED_BASE_URL", "http://127.0.0.1:8081/v1"),
+            embed_api_key=os.getenv("EMBED_API_KEY", "no-key-required"),
+            embed_model=os.getenv("EMBED_MODEL", "multilingual-e5-large-f16"),
+            
+            summary_base_url=os.getenv("SUMMARY_BASE_URL", "http://127.0.0.1:8080/v1"),
+            summary_api_key=os.getenv("SUMMARY_API_KEY", "no-key-required"),
+            summary_model=os.getenv("SUMMARY_MODEL", "gemma-4-E4B-it-Q4_K_M"),
+            
             summary_temp=float(os.getenv("SUMMARY_TEMP", 1.0)),
             summary_top_p=float(os.getenv("SUMMARY_TOP_P", 0.95)),
             summary_top_k=int(os.getenv("SUMMARY_TOP_K", 64)),
-            n_ctx=int(os.getenv("N_CTX", 32768)),
-            n_gpu_layers=int(os.getenv("N_GPU_LAYERS", -1))
+            
+            weaviate_host=os.getenv("WEAVIATE_HOST", "localhost"),
+            weaviate_http_port=int(os.getenv("WEAVIATE_HTTP_PORT", 8080)),
+            weaviate_http_secure=os.getenv("WEAVIATE_HTTP_SECURE", "False").lower() == "true",
+            weaviate_grpc_port=int(os.getenv("WEAVIATE_GRPC_PORT", 50051)),
+            weaviate_grpc_secure=os.getenv("WEAVIATE_GRPC_SECURE", "False").lower() == "true"
         )

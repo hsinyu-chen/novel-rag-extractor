@@ -26,5 +26,5 @@ class SceneSummarizer:
                 "請輸出目前場景的摘要："
             )}
         ]
-        raw_text = self.engine.call_llm(messages)
-        return self.engine.parse_response(raw_text)
+        thought, summary = self.engine.call_llm(messages)
+        return thought, summary
