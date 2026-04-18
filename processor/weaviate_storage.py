@@ -260,9 +260,8 @@ class WeaviateStorage:
 
     def upsert_entity(self, novel_hash: str, vol_num: int, data_dict: dict, existing_uuid: str = None, scene_idx: int = 0, chunk_uuid: str = None) -> str:
         """
-        將最新的合併檔案，利用 BYOV 寫入 Weaviate
-        以 `vol_num` 為單位不覆蓋舊卷的，如果有 existing_uuid，是否該保留同一個 UUID？
-        在 Snapshot 架構中，每個 volume 應該要有自己的一筆 object，才能達成分開保存。
+        BYOV 寫入 NovelEntity。同卷內若提供 existing_uuid 則以 replace 更新，
+        否則建立新 UUID 的 object，確保每卷有自己的 snapshot。
 
         chunk_uuid (optional)：本次 scene 對應的 NovelChunk UUID，會被 union 進 chunk_refs。
         """
@@ -296,7 +295,6 @@ class WeaviateStorage:
             "content": json.dumps(data_dict, ensure_ascii=False)
         }
 
-        # 如果有 existing_uuid，我們使用 replace 確保不產生重複
         if existing_uuid:
             collection.data.replace(
                 uuid=existing_uuid,
@@ -305,7 +303,6 @@ class WeaviateStorage:
             )
             return existing_uuid
         else:
-            # 建立全新 UUID 並 insert
             target_uuid = str(uuid.uuid4())
             collection.data.insert(
                 uuid=target_uuid,
@@ -325,9 +322,9 @@ class WeaviateStorage:
 
     def _generate_chunk_vectors(self, title: str, content: str) -> Dict[str, List[float]]:
         """
-        Layer 1 用雙向量：
-          full_text：整段原文（受 e5 512-token 上限影響，暫不處理）
-          summary：scene 既有的 title 欄位（本身就是 LLM 生成的摘要）
+        Layer 1 雙向量：
+          full_text：整段原文（e5-large 截斷前 512 tokens）
+          summary：scene 的 title 欄位（LLM 生成的摘要）
         """
         full_text = content or ""
         summary_text = title or ""
@@ -340,7 +337,7 @@ class WeaviateStorage:
     def upsert_chunk(self, novel_hash: str, vol_num: int, scene_idx: int, title: str, content: str, token_count: int = 0) -> str:
         """
         寫入 / 覆寫單一 scene chunk。UUID 由 (novel_hash, vol, scene_idx) 決定，重跑 idempotent。
-        回傳 chunk UUID。entity_refs 不在此處寫入，由 _merge_step 完成後呼叫 update_chunk_entity_refs 回填。
+        entity_refs 留空，由 update_chunk_entity_refs 於 scene 結束後回填。回傳 chunk UUID。
         """
         collection = self._client.collections.get("NovelChunk")
         target_uuid = self.chunk_uuid(novel_hash, vol_num, scene_idx)

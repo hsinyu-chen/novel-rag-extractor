@@ -22,8 +22,7 @@ class KnowledgeProcess:
         self.conf = config
         self.console = Console()
 
-        # 宣告式 LCEL Chain 組裝（雙層架構）
-        # Layer 1 先寫 → 抽取 → 逐 entity inline merge+upsert → 回填 chunk.entity_refs → 寫 scene JSON
+        # LCEL Chain：Layer 1 寫入 → 抽取 → 逐 entity merge+upsert → 回填 chunk.entity_refs → 寫 scene JSON
         self.chain = (
             RunnableLambda(self._write_chunk_step) |
             RunnableLambda(self._extract_step) |
@@ -85,7 +84,7 @@ class KnowledgeProcess:
         if progress and tasks_ui:
             progress.update(tasks_ui["extract_task"], completed=100)
 
-        # [NEW LOG] 記錄 Step 1 提取結果與 Prompt
+        # 記錄 Step 1 提取結果與 Prompt
         scene_idx = scene_data.get("scene_index", 0)
         novel_hash = params.get("novel_hash")
         self._save_log(novel_hash, f"scene_{scene_idx:03d}_extraction_step1_entities.json", {
@@ -101,10 +100,9 @@ class KnowledgeProcess:
         }
 
     def _merge_step(self, data: dict, config: RunnableConfig) -> dict:
-        """LCEL Step 2: 檔案檢閱、合併、inline upsert
+        """LCEL Step 2: Per-entity RAG 檢索 → LLM merge/create → inline upsert 到 Layer 2。
 
-        將 upsert 動作搬入 per-entity 迴圈（原本在 _save_step 是全 scene 批次），
-        讓同 scene 的後續別名可以透過 RAG 看到剛寫入的前置條目。
+        Inline upsert 讓同 scene 後續別名能透過 RAG 看到剛寫入的前置條目。
         """
         params = config.get("configurable", {})
         progress = params.get("progress")
@@ -140,9 +138,8 @@ class KnowledgeProcess:
             if progress and tasks_ui:
                 progress.update(tasks_ui["merge_task"], description=f"[yellow]Merging Entity: {keyword} ({e_type})...")
 
-            # [Top-K RAG] 從 Weaviate 檢索受限於相同小說與卷數的候選人
-            # 雙軌門檻走 config 預設 (rag_identity_strong/keep, rag_content_strong/min)
-            # 換模型或調試 LLM 自判能力時改 .env 即可，不必動程式
+            # Top-K RAG：受限於相同小說與卷數的候選人。
+            # 雙軌門檻由 config 提供（rag_identity_strong/keep, rag_content_strong/min），調整走 .env。
             candidates = self.weaviate_db.search_similar_entity(
                 novel_hash, vol_num, e_type, keyword, context, top_k=5
             )
@@ -231,7 +228,7 @@ class KnowledgeProcess:
                 elif final_desc in invalid_tokens:
                     self.console.print(f"[yellow]Warning: Skipped entity '{keyword}' due to empty/N/A description[/yellow]")
                 else:
-                    # Inline upsert：立刻寫進 Weaviate，讓同 scene 後續條目可以透過 RAG 看到它
+                    # Inline upsert：讓同 scene 後續條目可透過 RAG 看到此條目
                     e_type_final = merged_data.get("type", e_type)
                     try:
                         uuid_key = self.weaviate_db.upsert_entity(
@@ -276,9 +273,9 @@ class KnowledgeProcess:
         return data
 
     def _save_step(self, data: dict, config: RunnableConfig) -> dict:
-        """LCEL Step 4: 寫本地 JSON 備份 (world/*.json + scene_XXX.json)
+        """LCEL Step 4: 寫本地 JSON 備份 (world/*.json + scene_XXX.json)。
 
-        Weaviate 寫入已在 _merge_step 完成。此步驟純為 debug 用人類可讀檔案。
+        本地 JSON 為人類可讀的 debug / 還原用備份，Weaviate 寫入於 _merge_step 完成。
         """
         params = config.get("configurable", {})
         progress = params.get("progress")
@@ -344,7 +341,7 @@ class KnowledgeProcess:
         
         novel_hash = self.get_path_hash(base_data_path)
 
-        # --clean 機制: 這裡如果是 clean，是否清空 world 與 logs 庫？
+        # --clean：清空本卷 world 與 extraction logs 目錄
         if clean_output:
             import shutil
             world_dir = os.path.join("output", novel_hash, "world")
@@ -365,16 +362,16 @@ class KnowledgeProcess:
 
         vol_keys = []
         vol_dirs = self.storage.list_namespaces(f"{novel_hash}.scenes.processed")
-        
-        # list_keys 的回傳形式大概是 "<hash>.scenes.processed.vol_1", 所以我們要濾出要跑的集數
+
+        # 過濾出需要處理的卷數（形式為 "<hash>.scenes.processed.vol_N"）
         for vk in vol_dirs:
-            vol_str = vk.split('.')[-1] # "vol_1"
+            vol_str = vk.split('.')[-1]
             if not vol_str.startswith("vol_"): continue
             v_num = int(vol_str.split('_')[-1])
             if start_vol <= v_num and (end_vol == 0 or v_num <= end_vol):
                 vol_keys.append((v_num, vk))
-        
-        vol_keys.sort() # 按卷數小到大
+
+        vol_keys.sort()
 
         for v_num, vk in vol_keys:
             self.console.print(f"\n[cyan]>> Processing Volume {v_num}...[/cyan]")
@@ -383,10 +380,8 @@ class KnowledgeProcess:
                 self.console.print(f"[yellow]>> Clearing Weaviate Data for Volume {v_num}...[/yellow]")
                 self.weaviate_db.clear_novel_volume(novel_hash, v_num)
             
-            # 撈出該集下的所有 scenes
+            # 撈出該集下的所有 scenes 並依檔名排序
             scene_keys = self.storage.list_keys(vk)
-            # 因為 list_keys 是找第一層子檔，如果是資料夾會被略過，但 scenes 都是檔名，所以沒問題
-            # 確認撈出的順序是對的
             scene_keys.sort()
 
             with Progress(
@@ -396,7 +391,6 @@ class KnowledgeProcess:
                 overall_task = progress.add_task(f"[bold blue]Volume {v_num} scenes", total=len(scene_keys))
 
                 for scene_key in scene_keys:
-                    # e.g scene_key = novel_hash.scenes.processed.vol_1.scene_001
                     scene_data = self.storage.get(scene_key)
                     if not scene_data or not scene_data.get("content"):
                         progress.update(overall_task, advance=1)

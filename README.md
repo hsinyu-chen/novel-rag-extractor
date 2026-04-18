@@ -13,7 +13,7 @@
 
 兩層皆以 **Vol (卷數)** 作為切割單元，建立 **Snapshot Delta (增量快照)** 機制，確保模型在推理特定集數劇情時不會被「未來」的劇透污染。
 
-在資料一致性上，條目的本機檔名統一依賴 **Weaviate 核發的 UUID**，解決了同一人物因別名變化（例如 Saber → 亞瑟王）導致本地 JSON 孤兒檔的痛點。Chunk 則以 `(novel_hash, vol_num, scene_index)` 生成 **deterministic UUID (uuid5)**，保證重跑 idempotent。
+在資料一致性上，條目的本機檔名統一依賴 **Weaviate 核發的 UUID**，確保同一人物即使別名變化（例如 Saber → 亞瑟王）也不會產生本地 JSON 孤兒檔。Chunk 則以 `(novel_hash, vol_num, scene_index)` 生成 **deterministic UUID (uuid5)**，保證重跑 idempotent。
 
 ---
 
@@ -35,7 +35,7 @@ Named Vectors (BYOV)：
 - **`full_text`**：`content` 的向量，支援「語意搜尋原文片段」
 - **`summary`**：`title` 的向量，支援「根據劇情摘要找 scene」
 
-> ⚠️ **已知限制**：`multilingual-e5-large` 有 512-token 上限，scene 中位數 ~1844 tokens，超長部分會被截斷。目前接受此限制，後續視召回情形再決定是否換 `bge-m3` 或改為 sliding window chunking。
+> ⚠️ **Embed 模型限制**：`multilingual-e5-large` 有 512-token 上限，scene 中位數 ~1844 tokens，full_text 向量只覆蓋前 512 tokens。摘要向量（`summary`）用來回補尾段召回。
 
 ### 2.2 Layer 2 — `NovelEntity` (條目)
 
@@ -90,7 +90,7 @@ Named Vectors (BYOV)：
    | `content_sim ≥ 0.45` | 描述極度吻合，即使名字毫無關聯也放行（例如隱藏身份橋段）。 |
    | 其他 | **程式端直接剔除，不送給 LLM，防範望文生義的誤合併。** |
 
-> 📌 **為什麼要程式端過濾？** 先前曾出現「劍」被 RAG 匹配到「儲倉」分數 0.5 的案例。根因是 Weaviate hybrid score 是 RRF 融合值，在小資料庫下排第一就近 0.5，與實際語義無關。新協定用真餘弦相似度把關，並以字面共字做硬閘門。
+> 📌 **為什麼要程式端過濾？** Weaviate hybrid score 是 RRF 融合值，在小資料庫下排第一就近 0.5，與實際語義無關。本協定改以真餘弦相似度把關，並用字面共字做硬閘門，避免語義無關的條目被送進 LLM 誤判合併。
 
 ### 3.3 知識提取與決策分流 (Branching Decision Logic)
 為了提高效率並防止邏輯混亂，系統在處理新條目時會根據 Weaviate 的檢索結果進行分流：
@@ -123,15 +123,13 @@ write_chunk_step      → Layer 1 upsert，回傳 chunk_uuid（deterministic UUI
 extract_step          → LLM 抽取 entities
     │
 merge_step            → Per-entity：RAG 檢索 → LLM merge/create → inline upsert 到 Layer 2
-    │                   （★ inline upsert 是修正 P1 的關鍵：同 scene 後續別名能
-    │                      即時透過 RAG 看到剛寫入的前置條目）
     │
 backfill_chunk_refs   → Scene 結束後，把本場所有 entity UUIDs 回填到 chunk.entity_refs
     │
 save_scene_json       → 寫 `world/<type>/<uuid>.json` 與 augment `scene_XXX.json`
 ```
 
-> 📌 **為什麼 inline upsert 關鍵？** 先前 upsert 延到 `_save_step` 批次執行，導致同 scene 內「迪朗達爾 / 聖劍 / 王者之劍」三個別名在 merge 期間看不見彼此（Weaviate 裡還沒寫入），結果各自被視為新條目。inline upsert 讓第二、第三個別名的 RAG 檢索能命中第一個已寫入的條目。
+> 📌 **為什麼 inline upsert？** 每個 entity merge 完成後立即寫入 Weaviate，讓同 scene 後續別名（例如「迪朗達爾 / 聖劍 / 王者之劍」）的 RAG 檢索能看到剛寫入的前置條目，從而正確合併而不是各自被視為新條目。
 
 ---
 

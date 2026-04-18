@@ -3,7 +3,7 @@ import re
 from typing import List, Dict, Any, Tuple, Callable
 from processor.llm_engine import NativeLlamaEngine
 
-# 禁止的無辨識度 placeholder keyword（方案 A：敘述性代號）
+# 禁止的無辨識度 placeholder keyword（以敘述性代號取代）
 # - 編號流水系列: 未知人物A/B/1、人物X、角色甲 ...
 # - 泛稱單詞: 男子、女子、路人、少年 (獨字時無辨識度)
 _PLACEHOLDER_REGEX = re.compile(
@@ -130,9 +130,9 @@ class KnowledgeAgent:
                     continue
                 if kw_upper in ["N/A", "NONE", "NULL", "未知", "無"]:
                     continue
-                # 方案 A：禁止編號式或泛稱 placeholder (未知人物A、男子、路人...)
+                # 禁止編號式或泛稱 placeholder (未知人物A、男子、路人...)，應改用敘述性代號
                 if _PLACEHOLDER_REGEX.match(kw_raw):
-                    print(f"[KnowledgeAgent] Dropping placeholder keyword: '{kw_raw}' (方案 A：需使用敘述性代號)")
+                    print(f"[KnowledgeAgent] Dropping placeholder keyword: '{kw_raw}' (需使用敘述性代號)")
                     continue
                 # 敘述無效則 bypass 整個 keyword (context_summary 為空/N/A/None)
                 ctx_raw = str(e.get("context_summary", "")).strip()
@@ -148,7 +148,7 @@ class KnowledgeAgent:
 
     def create_initial_entity(self, keyword: str, entity_type: str, new_context: str, current_scene_index: int, scene_excerpt: str = "") -> Tuple[str, dict, list]:
         """
-        Step 2 - 分流 A: 初始化全然新條目 (極簡結構)
+        Step 2 - 分流 A: 初始化全然新條目
         """
         schema = {
             "type": "object",
@@ -215,7 +215,7 @@ class KnowledgeAgent:
 
     def merge_entity(self, keyword: str, entity_type: str, new_context: str, candidates: List[dict], current_scene_index: int, scene_excerpt: str = "") -> Tuple[str, dict, list]:
         """
-        Step 2 - 分流 B: 條目合併與情報更新 (極簡結構)
+        Step 2 - 分流 B: 條目合併與情報更新
         """
         schema = {
             "type": "object",
