@@ -6,13 +6,38 @@
 
 ## 1. 核心概念 (Core Concepts)
 
-系統將條目資料（角色、道具、地點等）的狀態以 **Vol (卷數)** 作為切割單元，建立起 **Snapshot Delta (增量快照)** 的機制，確保模型在後續推理特定集數的劇情時，不會被來自「未來」的劇透與設定給污染。
+系統採用 **雙層向量架構**：
 
-在資料一致性上，此架構捨棄使用「條目名稱 (Keyword)」作為本機條目 JSON 檔名的方式。條目的本機檔名統一依賴 **Weaviate 核發的 UUID**。這徹底解決了同一個人物在劇中因為被更改別名、職階（例如：從 Saber 變成 亞瑟王）而導致本地 JSON 孤兒檔案分歧的痛點。
+- **Layer 1 — `NovelChunk`**：敘事分片（scene 粒度），保存原文與摘要兩組向量。作為 RAG 的「事實來源」(ground truth)，即使 Layer 2 條目合併失敗，使用者仍可透過 chunk 向量召回原文，不會漏資訊。
+- **Layer 2 — `NovelEntity`**：從 chunk 抽取出的條目（角色、道具、地點等），透過 `chunk_refs` 反指 Layer 1。條目層 merge 失敗從「災難」降級為「索引不漂亮」，不影響檢索。
+
+兩層皆以 **Vol (卷數)** 作為切割單元，建立 **Snapshot Delta (增量快照)** 機制，確保模型在推理特定集數劇情時不會被「未來」的劇透污染。
+
+在資料一致性上，條目的本機檔名統一依賴 **Weaviate 核發的 UUID**，解決了同一人物因別名變化（例如 Saber → 亞瑟王）導致本地 JSON 孤兒檔的痛點。Chunk 則以 `(novel_hash, vol_num, scene_index)` 生成 **deterministic UUID (uuid5)**，保證重跑 idempotent。
 
 ---
 
-## 2. Weaviate Collection 實作結構 (`NovelEntity`)
+## 2. Weaviate Collection 實作結構
+
+### 2.1 Layer 1 — `NovelChunk` (敘事分片)
+
+| 屬性名稱       | 型別            | 說明 |
+|----------------|-----------------|------|
+| `novel_hash`   | `TEXT`          | 小說編號（skip_vectorization，FIELD tokenization） |
+| `vol_num`      | `INT`           | 卷數 |
+| `scene_index`  | `INT`           | 卷內分片序號 |
+| `title`        | `TEXT`          | Scene 摘要（LLM 在 pre-process 階段生成） |
+| `content`      | `TEXT`          | 原文全文 |
+| `token_count`  | `INT`           | 原文 token 數 |
+| `entity_refs`  | `TEXT_ARRAY`    | 此 scene 抽取到的所有 entity UUIDs（scene 結束時回填） |
+
+Named Vectors (BYOV)：
+- **`full_text`**：`content` 的向量，支援「語意搜尋原文片段」
+- **`summary`**：`title` 的向量，支援「根據劇情摘要找 scene」
+
+> ⚠️ **已知限制**：`multilingual-e5-large` 有 512-token 上限，scene 中位數 ~1844 tokens，超長部分會被截斷。目前接受此限制，後續視召回情形再決定是否換 `bge-m3` 或改為 sliding window chunking。
+
+### 2.2 Layer 2 — `NovelEntity` (條目)
 
 為了方便跨書系搜尋與維護單一索引，該系統將所有小說的條目都集中儲存在 `NovelEntity` 集合中，透過 Metadata 以及自帶的 CJK 分詞器保證精確查找。
 
@@ -27,6 +52,7 @@
 | `categories`      | `TEXT_ARRAY` (陣列)  | 標籤分類，例如 `["劍", "武器"]`。<br/>*Tokenization `FIELD`，100% 精準匹配「列出所有劍」這類列舉需求* |
 | `description`     | `TEXT`               | 豐富的文本描述（含外觀、性格、功能等關鍵設定）。<br/>*Tokenization `GSE` 中文分詞器，供 hybrid BM25 模糊檢索* |
 | `appeared_in`     | `INT_ARRAY` (陣列)   | 實體曾在哪些分片（Scene ID）中被提及。由程式碼維護。 |
+| `chunk_refs`      | `TEXT_ARRAY` (陣列)  | 指回 Layer 1 (`NovelChunk`) 的 UUID 清單。由程式碼 union 維護。<br/>*配置 `skip_vectorization=True`，Tokenization `FIELD`* |
 | `content`         | `TEXT`               | 該實體完整的極簡 JSON 字串備份。<br/>*配置 `skip_vectorization=True`* |
 
 > 💡 **分詞器選擇原則**：
@@ -85,6 +111,27 @@
 2. **別名聯集 (Alias Merging)**：自動合併新舊資料中所有的別名。
 3. **重大狀態變更整合 (Status Aggregation)**：自動合併並按場景順序排列 `major_status_changes`。
 4. **場景追蹤 (`appeared_in`)**：由程式碼嚴格維護，記錄實體曾在哪一卷、哪一場景出現過。
+5. **Chunk 追蹤 (`chunk_refs`)**：由程式碼 union 維護，新 chunk UUID 會併入既有清單，合併兩實體時保留舊實體的 chunk_refs。
+
+### 3.4 Per-Scene LCEL Pipeline
+
+每個 scene 依序經過五個 Runnable step，以 LCEL 串接：
+
+```
+write_chunk_step      → Layer 1 upsert，回傳 chunk_uuid（deterministic UUID，重跑 idempotent）
+    │
+extract_step          → LLM 抽取 entities
+    │
+merge_step            → Per-entity：RAG 檢索 → LLM merge/create → inline upsert 到 Layer 2
+    │                   （★ inline upsert 是修正 P1 的關鍵：同 scene 後續別名能
+    │                      即時透過 RAG 看到剛寫入的前置條目）
+    │
+backfill_chunk_refs   → Scene 結束後，把本場所有 entity UUIDs 回填到 chunk.entity_refs
+    │
+save_scene_json       → 寫 `world/<type>/<uuid>.json` 與 augment `scene_XXX.json`
+```
+
+> 📌 **為什麼 inline upsert 關鍵？** 先前 upsert 延到 `_save_step` 批次執行，導致同 scene 內「迪朗達爾 / 聖劍 / 王者之劍」三個別名在 merge 期間看不見彼此（Weaviate 裡還沒寫入），結果各自被視為新條目。inline upsert 讓第二、第三個別名的 RAG 檢索能命中第一個已寫入的條目。
 
 ---
 
@@ -94,24 +141,26 @@
 
 #### 條目檔案 (Entity Profiles)
 路徑：`output/<hash>/world/vol_<X>/<type>/<UUID>.json`
-每一次 Weaviate 更新，就同步用最新的 JSON 內容將檔案複寫在本卷的資料夾下。同一卷內重複出現的人物會不斷堆疊 `appeared_in` 與 `turning_points` 資訊。
+每一次 Weaviate 更新，就同步用最新的 JSON 內容將檔案複寫在本卷的資料夾下。同一卷內重複出現的人物會不斷堆疊 `appeared_in`、`chunk_refs` 與 `major_status_changes` 資訊。
 
 #### 場景分片附加資訊 (Scene Enhancements)
 路徑：`output/<hash>/scenes/processed/vol_<X>/scene_<Y>.json`
-在每個分片的處理尾聲，該分片會補上自己內部出現過的所有條目清單：
+在每個分片的處理尾聲，該分片會補上自己對應的 `chunk_uuid` 與本場出現過的所有條目清單：
 ```json
 {
   ...
+  "chunk_uuid": "d1f3...-a1b2",
   "entities_extracted": [
      {
        "keyword": "阿爾托莉雅",
        "type": "character",
-       "uuid": "8a92b23-...."
+       "uuid": "8a92b23-....",
+       "chunk_uuid": "d1f3...-a1b2"
      }
   ]
 }
 ```
-這個架構將允許未來的「Scene Agent（分片特化 RAG 總結器）」能夠 `O(1)` 精準帶著 UUID 去本機抓取當時完整的條目世界觀，徹底消除因為別名不同導致找不到伏筆與裝備的錯誤。
+這個架構允許「Scene Agent」以 `O(1)` 精準帶著 UUID 去本機/Weaviate 抓取當時完整的條目世界觀，徹底消除因別名不同導致找不到伏筆與裝備的錯誤；同時雙向鏈結（`NovelChunk.entity_refs` ⇄ `NovelEntity.chunk_refs`）讓任何一端都可以回推另一端。
 
 ---
 

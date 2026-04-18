@@ -6,10 +6,16 @@ from weaviate.classes.config import Property, DataType, Configure, Tokenization,
 from weaviate.classes.query import Filter, MetadataQuery
 from weaviate.classes.data import DataObject
 
+# 固定 namespace，用於從 (novel_hash, vol_num, scene_index) 生成 deterministic chunk UUID
+_CHUNK_UUID_NAMESPACE = uuid.UUID("6f3a1e4c-2a93-4b5e-9c3a-1c4d9e7f0a11")
+
+
 class WeaviateStorage:
     """
     Weaviate 向量庫封裝
-    負責連線管理與 NovelEntity Collection 面向存取 (包含 Named Vectors 操作)
+    雙層架構：
+      - Layer 1 (NovelChunk)：敘事分片，存原文與摘要向量
+      - Layer 2 (NovelEntity)：抽取出的條目，透過 chunk_refs 指回 Layer 1
     """
     def __init__(self, config, embed_func):
         self.conf = config
@@ -23,7 +29,7 @@ class WeaviateStorage:
         http_secure = self.conf.get("weaviate_http_secure", False)
         grpc_port = self.conf.get("weaviate_grpc_port", 50051)
         grpc_secure = self.conf.get("weaviate_grpc_secure", False)
-        
+
         print(f"Connecting to Weaviate at {host}...")
         self._client = weaviate.connect_to_custom(
             http_host=host,
@@ -33,9 +39,13 @@ class WeaviateStorage:
             grpc_port=grpc_port,
             grpc_secure=grpc_secure
         )
-        self._ensure_collection()
+        self._ensure_collections()
 
-    def _ensure_collection(self):
+    def _ensure_collections(self):
+        self._ensure_entity_collection()
+        self._ensure_chunk_collection()
+
+    def _ensure_entity_collection(self):
         collection_name = "NovelEntity"
         if not self._client.collections.exists(collection_name):
             print(f"Creating Weaviate Collection '{collection_name}' with Named Vectors...")
@@ -49,8 +59,9 @@ class WeaviateStorage:
                     Property(name="aliases", data_type=DataType.TEXT_ARRAY, tokenization=Tokenization.FIELD),
                     Property(name="categories", data_type=DataType.TEXT_ARRAY, tokenization=Tokenization.FIELD),
                     Property(name="appeared_in", data_type=DataType.INT_ARRAY),
+                    Property(name="chunk_refs", data_type=DataType.TEXT_ARRAY, skip_vectorization=True, tokenization=Tokenization.FIELD),
                     Property(name="description", data_type=DataType.TEXT, tokenization=Tokenization.GSE),
-                    Property(name="content", data_type=DataType.TEXT, skip_vectorization=True) 
+                    Property(name="content", data_type=DataType.TEXT, skip_vectorization=True)
                 ],
                 # 宣告多組獨立向量空間 (BYOV 模式)
                 vectorizer_config=[
@@ -58,6 +69,30 @@ class WeaviateStorage:
                     Configure.NamedVectors.none(name="content")
                 ],
                 # 徹底關閉 GSE 的停用詞過濾，允許所有切詞進行 BM25 比對
+                inverted_index_config=Configure.inverted_index(
+                    stopwords_preset=StopwordsPreset.NONE
+                )
+            )
+
+    def _ensure_chunk_collection(self):
+        collection_name = "NovelChunk"
+        if not self._client.collections.exists(collection_name):
+            print(f"Creating Weaviate Collection '{collection_name}' with Named Vectors...")
+            self._client.collections.create(
+                name=collection_name,
+                properties=[
+                    Property(name="novel_hash", data_type=DataType.TEXT, skip_vectorization=True, tokenization=Tokenization.FIELD),
+                    Property(name="vol_num", data_type=DataType.INT),
+                    Property(name="scene_index", data_type=DataType.INT),
+                    Property(name="title", data_type=DataType.TEXT, tokenization=Tokenization.GSE),
+                    Property(name="content", data_type=DataType.TEXT, tokenization=Tokenization.GSE),
+                    Property(name="token_count", data_type=DataType.INT),
+                    Property(name="entity_refs", data_type=DataType.TEXT_ARRAY, skip_vectorization=True, tokenization=Tokenization.FIELD),
+                ],
+                vectorizer_config=[
+                    Configure.NamedVectors.none(name="full_text"),
+                    Configure.NamedVectors.none(name="summary"),
+                ],
                 inverted_index_config=Configure.inverted_index(
                     stopwords_preset=StopwordsPreset.NONE
                 )
@@ -223,23 +258,31 @@ class WeaviateStorage:
         if content_sim is not None:
             entry["content_sim"] = max(entry["content_sim"], content_sim)
 
-    def upsert_entity(self, novel_hash: str, vol_num: int, data_dict: dict, existing_uuid: str = None, scene_idx: int = 0) -> str:
+    def upsert_entity(self, novel_hash: str, vol_num: int, data_dict: dict, existing_uuid: str = None, scene_idx: int = 0, chunk_uuid: str = None) -> str:
         """
         將最新的合併檔案，利用 BYOV 寫入 Weaviate
         以 `vol_num` 為單位不覆蓋舊卷的，如果有 existing_uuid，是否該保留同一個 UUID？
         在 Snapshot 架構中，每個 volume 應該要有自己的一筆 object，才能達成分開保存。
+
+        chunk_uuid (optional)：本次 scene 對應的 NovelChunk UUID，會被 union 進 chunk_refs。
         """
         collection = self._client.collections.get("NovelEntity")
-        
+
         # 計算多重向量
         named_vectors = self._generate_entity_vectors(data_dict)
-        
+
         # 維護 appeared_in 陣列
         appeared_in = data_dict.get("appeared_in", [])
         if scene_idx > 0 and scene_idx not in appeared_in:
             appeared_in.append(scene_idx)
             data_dict["appeared_in"] = appeared_in
-            
+
+        # 維護 chunk_refs：與現有 list 做 union，保持順序
+        chunk_refs = list(data_dict.get("chunk_refs", []) or [])
+        if chunk_uuid and chunk_uuid not in chunk_refs:
+            chunk_refs.append(chunk_uuid)
+        data_dict["chunk_refs"] = chunk_refs
+
         properties = {
             "novel_hash": novel_hash,
             "vol_num": vol_num,
@@ -249,6 +292,7 @@ class WeaviateStorage:
             "aliases": data_dict.get("aliases", []),
             "categories": data_dict.get("categories", []),
             "appeared_in": appeared_in,
+            "chunk_refs": chunk_refs,
             "content": json.dumps(data_dict, ensure_ascii=False)
         }
 
@@ -270,18 +314,91 @@ class WeaviateStorage:
             )
             return target_uuid
 
+    # ===== Layer 1 (NovelChunk) =====
+
+    def chunk_uuid(self, novel_hash: str, vol_num: int, scene_idx: int) -> str:
+        """
+        從 (novel_hash, vol_num, scene_index) 生成 deterministic UUID，保證重跑 idempotent。
+        """
+        key = f"{novel_hash}:vol{vol_num}:scene{scene_idx}"
+        return str(uuid.uuid5(_CHUNK_UUID_NAMESPACE, key))
+
+    def _generate_chunk_vectors(self, title: str, content: str) -> Dict[str, List[float]]:
+        """
+        Layer 1 用雙向量：
+          full_text：整段原文（受 e5 512-token 上限影響，暫不處理）
+          summary：scene 既有的 title 欄位（本身就是 LLM 生成的摘要）
+        """
+        full_text = content or ""
+        summary_text = title or ""
+        vecs = self.embed_func.embed_documents([full_text, summary_text])
+        return {
+            "full_text": vecs[0],
+            "summary": vecs[1],
+        }
+
+    def upsert_chunk(self, novel_hash: str, vol_num: int, scene_idx: int, title: str, content: str, token_count: int = 0) -> str:
+        """
+        寫入 / 覆寫單一 scene chunk。UUID 由 (novel_hash, vol, scene_idx) 決定，重跑 idempotent。
+        回傳 chunk UUID。entity_refs 不在此處寫入，由 _merge_step 完成後呼叫 update_chunk_entity_refs 回填。
+        """
+        collection = self._client.collections.get("NovelChunk")
+        target_uuid = self.chunk_uuid(novel_hash, vol_num, scene_idx)
+        named_vectors = self._generate_chunk_vectors(title, content)
+        properties = {
+            "novel_hash": novel_hash,
+            "vol_num": vol_num,
+            "scene_index": scene_idx,
+            "title": title or "",
+            "content": content or "",
+            "token_count": int(token_count or 0),
+            "entity_refs": [],
+        }
+        if collection.data.exists(target_uuid):
+            collection.data.replace(uuid=target_uuid, properties=properties, vector=named_vectors)
+        else:
+            collection.data.insert(uuid=target_uuid, properties=properties, vector=named_vectors)
+        return target_uuid
+
+    def update_chunk_entity_refs(self, chunk_uuid: str, entity_uuids: List[str]):
+        """
+        Scene 所有 entity 寫入完成後，回填 entity UUID 清單到對應 chunk。
+        只更新 entity_refs 欄位，不動向量。
+        """
+        if not chunk_uuid:
+            return
+        collection = self._client.collections.get("NovelChunk")
+        dedup = []
+        seen = set()
+        for u in entity_uuids or []:
+            if u and u not in seen:
+                seen.add(u)
+                dedup.append(u)
+        try:
+            collection.data.update(
+                uuid=chunk_uuid,
+                properties={"entity_refs": dedup}
+            )
+        except Exception as e:
+            print(f"[Weaviate] Failed to update chunk entity_refs for {chunk_uuid}: {e}")
+
     def clear_novel_volume(self, novel_hash: str, vol_num: int):
         """
-        清除 Weaviate 中特定小說某卷的所有條目資料
+        清除 Weaviate 中特定小說某卷的所有條目 (NovelEntity) 與分片 (NovelChunk)。
         """
-        collection = self._client.collections.get("NovelEntity")
+        entity_col = self._client.collections.get("NovelEntity")
+        chunk_col = self._client.collections.get("NovelChunk")
+        vol_filter = Filter.by_property("novel_hash").equal(novel_hash) & Filter.by_property("vol_num").equal(vol_num)
         try:
-            collection.data.delete_many(
-                where=Filter.by_property("novel_hash").equal(novel_hash) & Filter.by_property("vol_num").equal(vol_num)
-            )
+            entity_col.data.delete_many(where=vol_filter)
             print(f"  [Weaviate] Cleared NovelEntity for Hash={novel_hash}, Vol={vol_num}")
         except Exception as e:
-            print(f"  [Weaviate] Error clearing volume: {e}")
+            print(f"  [Weaviate] Error clearing entity volume: {e}")
+        try:
+            chunk_col.data.delete_many(where=vol_filter)
+            print(f"  [Weaviate] Cleared NovelChunk for Hash={novel_hash}, Vol={vol_num}")
+        except Exception as e:
+            print(f"  [Weaviate] Error clearing chunk volume: {e}")
 
     def get_existing_entity_types(self) -> List[str]:
         """

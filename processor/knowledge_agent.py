@@ -91,20 +91,26 @@ class KnowledgeAgent:
         system_prompt = (
             "你是一個專業的小說分析專家。請從文本中提取關鍵條目。準則：\n"
             "1. **禁止提取現實世界事物**：如「日本」、「東京」等。\n"
-            "2. **使用原文名稱**：若文本已給出官方稱呼或代號，keyword 必須原文照搬。\n"
-            "3. **無名人物命名規範 (重要)**：\n"
+            "2. **禁止提取「文本夾雜物」(重要)**：爬蟲/掃描/轉載過程中混入的非故事內容，一律不得提取：\n"
+            "   - 小說網站/轉載平台的浮水印式署名：如「本文由 XX 論壇轉載」、「輕之國度發布」、「Syosetu 原著」等訊息性字串。\n"
+            "   - 譯者/校對/上傳者的署名、後記、前言、版權聲明、催更廣告、贊助訊息、群組 ID。\n"
+            "   - 章節標題、卷號、頁碼、分隔線、排版標記等版面元素。\n"
+            "   - **判別基準**：該字串**只在文本邊緣出現一次、與劇情角色互動無關**時，才視為夾雜物。\n"
+            "   - **反例 (應該提取)**：若小說劇情本身就在描寫出版業、編輯工作、輕小說作者 (如《白箱》《文學少女》題材)，且網站/出版社/編輯職位**作為故事內的實體與角色互動**，則屬於正常條目，請如實提取。\n"
+            "3. **使用原文名稱**：若文本已給出官方稱呼或代號，keyword 必須原文照搬。\n"
+            "4. **無名人物命名規範 (重要)**：\n"
             "   - **禁止**使用「未知人物A」、「未知人物B」、「人物1」、「角色X」、「男子」、「女人」、「路人」這類無辨識度的編號或泛稱作為 keyword。\n"
             "   - **禁止**使用 A/B/C/甲乙丙 等流水編號，**因為跨場景時你無從得知當前計數位置**，會造成合併錯亂。\n"
             "   - **必做**：用該角色在文本中最具辨識度的**外觀/職能/服裝/種族特徵**組成 2-8 字的敘述性代號。\n"
             "     * 範例：「戴面具的男子」「白髮紅眼少女」「蜥蜴人騎兵長」「穿紅衣的老乞丐」「駕迅猛龍的戰士」。\n"
             "     * 若同一無名角色曾在前文出現過並已經用過某敘述性代號，**沿用該代號**（從描述辨識）。\n"
             "     * 若後續文本揭露真名，直接用真名作 keyword（系統會自動把舊代號納入 aliases）。\n"
-            "4. **輸出語言要求**：按照文章原文輸出。\n"
-            "5. **分類參考**：盡量使用現有類別：" + types_str + "\n"
-            "6. **人物強制**：如果是人物，必須為 'character'。\n"
-            "7. **過濾瑣碎事物**：禁止提取無獨特性、無劇情重要性的普通日常用品（如：錢包、茶杯、普通衣服）。僅提取具備獨特名稱、特殊能力或對情節有推動作用的關鍵條目。\n"
-            "8. **禁止湊數**：如果文本中沒有符合條件的關鍵條目，請返回空陣列 `[]`。嚴禁編造實體或使用「N/A」、「None」、「空白」等佔位符作為關鍵字。\n"
-            "9. **人名辨識強化**：任何明顯的人名（尤其是日文姓名如佐藤、瑞穗，或西方姓名），分類必須強制設為 'character'。禁止歸類為 'world-setting' 或其他類別。"
+            "5. **輸出語言要求**：按照文章原文輸出。\n"
+            "6. **分類參考**：盡量使用現有類別：" + types_str + "\n"
+            "7. **人物強制**：如果是人物，必須為 'character'。\n"
+            "8. **過濾瑣碎事物**：禁止提取無獨特性、無劇情重要性的普通日常用品（如：錢包、茶杯、普通衣服）。僅提取具備獨特名稱、特殊能力或對情節有推動作用的關鍵條目。\n"
+            "9. **禁止湊數**：如果文本中沒有符合條件的關鍵條目，請返回空陣列 `[]`。嚴禁編造實體或使用「N/A」、「None」、「空白」等佔位符作為關鍵字。\n"
+            "10. **人名辨識強化**：任何明顯的人名（尤其是日文姓名如佐藤、瑞穗，或西方姓名），分類必須強制設為 'character'。禁止歸類為 'world-setting' 或其他類別。"
         )
 
         messages = [
@@ -127,6 +133,12 @@ class KnowledgeAgent:
                 # 方案 A：禁止編號式或泛稱 placeholder (未知人物A、男子、路人...)
                 if _PLACEHOLDER_REGEX.match(kw_raw):
                     print(f"[KnowledgeAgent] Dropping placeholder keyword: '{kw_raw}' (方案 A：需使用敘述性代號)")
+                    continue
+                # 敘述無效則 bypass 整個 keyword (context_summary 為空/N/A/None)
+                ctx_raw = str(e.get("context_summary", "")).strip()
+                ctx_upper = ctx_raw.upper()
+                if not ctx_raw or ctx_upper in ["N/A", "NONE", "NULL", "無", "未知", "無資料", "無相關資訊"]:
+                    print(f"[KnowledgeAgent] Dropping keyword '{kw_raw}' due to empty/N/A context_summary")
                     continue
                 valid_entities.append(e)
             data["entities"] = valid_entities
@@ -190,6 +202,12 @@ class KnowledgeAgent:
             res_kw = str(data.get("keyword", "")).strip()
             if res_kw != keyword:
                 print(f"[KnowledgeAgent] Validation failed: Keyword mismatch. Expected '{keyword}', got '{res_kw}'")
+                return False
+            # 敘述無效則拒絕 (description 為空/N/A)
+            desc_raw = str(data.get("description", "")).strip()
+            desc_upper = desc_raw.upper()
+            if not desc_raw or desc_upper in ["N/A", "NONE", "NULL", "無", "未知", "無資料", "無相關資訊"]:
+                print(f"[KnowledgeAgent] Validation failed: Empty/N/A description for '{keyword}'")
                 return False
             return True
 
@@ -278,6 +296,12 @@ class KnowledgeAgent:
                     return False
             
             if not res_kw or res_kw.upper() in ["N/A", "NONE", "NULL"]: return False
+            # 敘述無效則拒絕 (description 為空/N/A)
+            desc_raw = str(data.get("description", "")).strip()
+            desc_upper = desc_raw.upper()
+            if not desc_raw or desc_upper in ["N/A", "NONE", "NULL", "無", "未知", "無資料", "無相關資訊"]:
+                print(f"[KnowledgeAgent] Validation failed: Empty/N/A description for '{keyword}'")
+                return False
             return True
 
         return self._call_with_schema(messages, schema, validator=validator)

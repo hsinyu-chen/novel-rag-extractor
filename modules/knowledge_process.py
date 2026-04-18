@@ -22,10 +22,13 @@ class KnowledgeProcess:
         self.conf = config
         self.console = Console()
 
-        # 宣告式 LCEL Chain 組裝
+        # 宣告式 LCEL Chain 組裝（雙層架構）
+        # Layer 1 先寫 → 抽取 → 逐 entity inline merge+upsert → 回填 chunk.entity_refs → 寫 scene JSON
         self.chain = (
+            RunnableLambda(self._write_chunk_step) |
             RunnableLambda(self._extract_step) |
             RunnableLambda(self._merge_step) |
+            RunnableLambda(self._backfill_chunk_refs_step) |
             RunnableLambda(self._save_step)
         )
         self.console.print("[bold green] Knowledge Process initialized.[/bold green]")
@@ -33,19 +36,52 @@ class KnowledgeProcess:
     def get_path_hash(self, path: str) -> str:
         return hashlib.md5(os.path.abspath(path).encode('utf-8')).hexdigest()[:8]
 
-    def _extract_step(self, scene_data: dict, config: RunnableConfig) -> dict:
+    def _write_chunk_step(self, scene_data: dict, config: RunnableConfig) -> dict:
+        """LCEL Step 0: Layer 1 寫入 — 把 scene 原文 + title 向量化存進 NovelChunk"""
+        params = config.get("configurable", {})
+        progress = params.get("progress")
+        tasks_ui = params.get("tasks_ui")
+        novel_hash = params.get("novel_hash")
+        vol_num = params.get("vol_num")
+
+        scene_idx = scene_data.get("scene_index", 0)
+        title = scene_data.get("title", "")
+        content = scene_data.get("content", "")
+        token_count = scene_data.get("token_count", 0)
+
+        if progress and tasks_ui:
+            progress.update(tasks_ui["chunk_task"], visible=True, description="[blue]Writing Chunk to Layer 1...")
+
+        chunk_uuid = None
+        try:
+            chunk_uuid = self.weaviate_db.upsert_chunk(
+                novel_hash, vol_num, scene_idx, title, content, token_count
+            )
+        except Exception as e:
+            self.console.print(f"[red]Failed to upsert chunk for scene {scene_idx}: {e}[/red]")
+
+        if progress and tasks_ui:
+            progress.update(tasks_ui["chunk_task"], completed=100)
+
+        return {
+            "scene_data": scene_data,
+            "chunk_uuid": chunk_uuid,
+        }
+
+    def _extract_step(self, data: dict, config: RunnableConfig) -> dict:
         """LCEL Step 1: 條目提取"""
         params = config.get("configurable", {})
         progress = params.get("progress")
         tasks_ui = params.get("tasks_ui")
-        
+
+        scene_data = data["scene_data"]
         content = scene_data.get("content", "")
         if progress and tasks_ui:
             progress.update(tasks_ui["extract_task"], visible=True, description="[cyan]Extracting Entities from Scene...")
 
         existing_types = params.get("existing_types", [])
         thought, result, prompt = self.agent.extract_entities(content, existing_types)
-        
+
         if progress and tasks_ui:
             progress.update(tasks_ui["extract_task"], completed=100)
 
@@ -59,14 +95,17 @@ class KnowledgeProcess:
             "result": result
         })
 
-        # 傳遞萃取到的條目到下一個步驟，同時也保留原始資料
         return {
-            "scene_data": scene_data,
+            **data,
             "extracted_entities": result.get("entities", [])
         }
 
     def _merge_step(self, data: dict, config: RunnableConfig) -> dict:
-        """LCEL Step 2: 檔案檢閱與合併"""
+        """LCEL Step 2: 檔案檢閱、合併、inline upsert
+
+        將 upsert 動作搬入 per-entity 迴圈（原本在 _save_step 是全 scene 批次），
+        讓同 scene 的後續別名可以透過 RAG 看到剛寫入的前置條目。
+        """
         params = config.get("configurable", {})
         progress = params.get("progress")
         tasks_ui = params.get("tasks_ui")
@@ -77,8 +116,10 @@ class KnowledgeProcess:
         scene_data = data["scene_data"]
         entities = data["extracted_entities"]
         scene_idx = scene_data.get("scene_index", 0)
+        chunk_uuid = data.get("chunk_uuid")
 
         merged_entities = []
+        saved_entity_uuids = []
 
         if progress and tasks_ui and entities:
             progress.update(tasks_ui["merge_task"], visible=True, total=len(entities), completed=0)
@@ -116,7 +157,11 @@ class KnowledgeProcess:
                 for cand in candidates:
                     cand_copy = dict(cand)
                     cand_uuids.append(cand_copy.pop("_weaviate_uuid", None))
+                    # 移除 LLM 不需要看到的 RAG 評分與偵錯欄位
                     cand_copy.pop("_score", None)
+                    cand_copy.pop("_identity_sim", None)
+                    cand_copy.pop("_content_sim", None)
+                    cand_copy.pop("_match_track", None)
                     cand_copy.pop("appeared_in", None)
                     llm_candidates.append(cand_copy)
 
@@ -134,6 +179,9 @@ class KnowledgeProcess:
                     
                     # [場景繼承]
                     merged_data["appeared_in"] = old_obj.get("appeared_in", [])
+
+                    # [Chunk 繼承]：保留舊實體累積的 chunk_refs，新 chunk_uuid 會在 upsert_entity 內做 union
+                    merged_data["chunk_refs"] = list(old_obj.get("chunk_refs", []) or [])
 
                     # [名稱權限與別名優先級]
                     # 如果舊名稱不是「未知」，則強制鎖定舊名稱為 Canonical Name
@@ -174,27 +222,64 @@ class KnowledgeProcess:
                     "existing_uuid": existing_uuid
                 })
 
-                # 最後防線：如果經過 LLM 處理後 keyword 仍然無效，則拒絕存入
+                # 最後防線：如果經過 LLM 處理後 keyword 或 description 仍然無效，則拒絕存入
                 final_kw = str(merged_data.get("keyword", "")).strip().upper()
-                if final_kw and final_kw not in ["N/A", "NONE", "NULL", ""]:
-                    merged_entities.append({
-                        "keyword": merged_data["keyword"], # 使用最終確定的 Keyword
-                        "merged_data": merged_data,
-                        "existing_uuid": existing_uuid
-                    })
-                else:
+                final_desc = str(merged_data.get("description", "")).strip().upper()
+                invalid_tokens = {"N/A", "NONE", "NULL", "", "無", "未知", "無資料", "無相關資訊"}
+                if final_kw in invalid_tokens:
                     self.console.print(f"[yellow]Warning: Skipped entity with invalid keyword: '{keyword}'[/yellow]")
+                elif final_desc in invalid_tokens:
+                    self.console.print(f"[yellow]Warning: Skipped entity '{keyword}' due to empty/N/A description[/yellow]")
+                else:
+                    # Inline upsert：立刻寫進 Weaviate，讓同 scene 後續條目可以透過 RAG 看到它
+                    e_type_final = merged_data.get("type", e_type)
+                    try:
+                        uuid_key = self.weaviate_db.upsert_entity(
+                            novel_hash, vol_num, merged_data, existing_uuid, scene_idx, chunk_uuid=chunk_uuid
+                        )
+                    except Exception as ex:
+                        self.console.print(f"[red]Failed to upsert entity '{keyword}': {ex}[/red]")
+                        if progress and tasks_ui:
+                            progress.update(tasks_ui["merge_task"], advance=1)
+                        continue
+
+                    # 動態擴充現存的類型庫，後續 scene 的 extract_entities 能看到它
+                    if e_type_final not in params["existing_types"]:
+                        params["existing_types"].append(e_type_final)
+
+                    saved_entity_uuids.append(uuid_key)
+                    merged_entities.append({
+                        "keyword": merged_data["keyword"],
+                        "merged_data": merged_data,
+                        "uuid": uuid_key,
+                        "type": e_type_final,
+                    })
 
             if progress and tasks_ui:
                 progress.update(tasks_ui["merge_task"], advance=1)
 
         return {
-            "scene_data": scene_data,
-            "merged_entities": merged_entities
+            **data,
+            "merged_entities": merged_entities,
+            "saved_entity_uuids": saved_entity_uuids,
         }
 
+    def _backfill_chunk_refs_step(self, data: dict, config: RunnableConfig) -> dict:
+        """LCEL Step 3: 回填 chunk.entity_refs — 讓 Layer 1 也能反查本 scene 抽取到的所有 entity"""
+        chunk_uuid = data.get("chunk_uuid")
+        entity_uuids = data.get("saved_entity_uuids", [])
+        if chunk_uuid and entity_uuids:
+            try:
+                self.weaviate_db.update_chunk_entity_refs(chunk_uuid, entity_uuids)
+            except Exception as e:
+                self.console.print(f"[red]Failed to backfill chunk_refs for {chunk_uuid}: {e}[/red]")
+        return data
+
     def _save_step(self, data: dict, config: RunnableConfig) -> dict:
-        """LCEL Step 3: 更新儲存庫與標註原始切片"""
+        """LCEL Step 4: 寫本地 JSON 備份 (world/*.json + scene_XXX.json)
+
+        Weaviate 寫入已在 _merge_step 完成。此步驟純為 debug 用人類可讀檔案。
+        """
         params = config.get("configurable", {})
         progress = params.get("progress")
         tasks_ui = params.get("tasks_ui")
@@ -205,36 +290,30 @@ class KnowledgeProcess:
 
         scene_data = data["scene_data"]
         merged_entities = data["merged_entities"]
-        scene_idx = scene_data.get("scene_index", 0)
+        chunk_uuid = data.get("chunk_uuid")
 
         if progress and tasks_ui:
             progress.update(tasks_ui["save_task"], visible=True, description="[magenta]Saving updates...")
 
         entities_extracted = []
         for entity_info in merged_entities:
-            # 1. 存入 Weaviate VectorDB (UPSERT)
-            e_type = entity_info["merged_data"].get("type", "unknown")
-            uuid_key = self.weaviate_db.upsert_entity(novel_hash, vol_num, entity_info["merged_data"], entity_info["existing_uuid"], scene_idx)
-            
-            # 動態擴充現存的類型庫
-            if e_type not in params["existing_types"]:
-                params["existing_types"].append(e_type)
-            
-            # 2. 存入本機 JsonStorage 備份 (檔名使用 UUID)
+            uuid_key = entity_info["uuid"]
+            e_type = entity_info["type"]
+
+            # 本機 JSON 備份（以 UUID 為檔名）
             local_key = f"{novel_hash}.world.vol_{vol_num}.{e_type}.{uuid_key}"
             self.storage.set(local_key, entity_info["merged_data"])
-            
+
             entities_extracted.append({
                 "keyword": entity_info["keyword"],
                 "type": e_type,
-                "uuid": uuid_key
+                "uuid": uuid_key,
+                "chunk_uuid": chunk_uuid,
             })
 
-        # 3. 幫原本的 scene_data 加上豐富綁定條目資訊
-        # 防呆，假設之前有用 keywords 字串陣列，直接改版覆寫為關聯物件陣列
+        # 擴充 scene_data：新增 chunk_uuid 欄位 + entities_extracted 關聯
+        scene_data["chunk_uuid"] = chunk_uuid
         scene_data["entities_extracted"] = entities_extracted
-
-        # 4. 把 scene 存回原本的位置
         self.storage.set(scene_key, scene_data)
 
         if progress and tasks_ui:
@@ -325,6 +404,7 @@ class KnowledgeProcess:
 
                     # UI tasks
                     tasks_ui = {
+                        "chunk_task": progress.add_task("[blue]Chunking...", total=100, visible=False),
                         "extract_task": progress.add_task("[cyan]Extracting...", total=100, visible=False),
                         "merge_task": progress.add_task("[yellow]Merging...", total=100, visible=False),
                         "save_task": progress.add_task("[magenta]Saving...", total=100, visible=False)
