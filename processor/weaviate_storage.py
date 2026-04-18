@@ -44,10 +44,10 @@ class WeaviateStorage:
                 properties=[
                     Property(name="novel_hash", data_type=DataType.TEXT, skip_vectorization=True, tokenization=Tokenization.FIELD),
                     Property(name="vol_num", data_type=DataType.INT),
-                    Property(name="entity_type", data_type=DataType.TEXT, tokenization=Tokenization.GSE),
-                    Property(name="keyword", data_type=DataType.TEXT, tokenization=Tokenization.GSE),
-                    Property(name="aliases", data_type=DataType.TEXT_ARRAY, tokenization=Tokenization.GSE),
-                    Property(name="categories", data_type=DataType.TEXT_ARRAY, tokenization=Tokenization.GSE),
+                    Property(name="entity_type", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="keyword", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+                    Property(name="aliases", data_type=DataType.TEXT_ARRAY, tokenization=Tokenization.FIELD),
+                    Property(name="categories", data_type=DataType.TEXT_ARRAY, tokenization=Tokenization.FIELD),
                     Property(name="appeared_in", data_type=DataType.INT_ARRAY),
                     Property(name="description", data_type=DataType.TEXT, tokenization=Tokenization.GSE),
                     Property(name="content", data_type=DataType.TEXT, skip_vectorization=True) 
@@ -85,88 +85,143 @@ class WeaviateStorage:
             "content": vecs[1]
         }
 
-    def search_similar_entity(self, novel_hash: str, max_vol: int, entity_type: str, keyword: str, query_summary: str, top_k: int = 1) -> List[Dict[str, Any]]:
+    def search_similar_entity(self, novel_hash: str, max_vol: int, entity_type: str, keyword: str, query_summary: str, top_k: int = 5, min_score: float = None, identity_strong: float = None, identity_keep: float = None, content_strong: float = None) -> List[Dict[str, Any]]:
         """
-        利用 Hybrid Search (Text BM25 + Vector) 到 Weaviate 進行查表，找出候選名單。
-        具備二段式檢索：首波嘗試準確類型過濾，失敗則放寬限制。
-        """
-        collection = self._client.collections.get("NovelEntity")
-        
-        # 強化 Search Text 加入部分背景，避免純 Keyword 觸發 Stopword 錯誤
-        search_text = f"{keyword} {query_summary[:200]}".strip()
-        if not search_text:
-             return []
+        雙軌檢索：
+          - Track A (identity)：純 keyword 走 near_vector，走 cosine 找同名 / 同人。
+          - Track B (content)：以情境摘要走 hybrid (BM25+vector)，抓別名未註冊但描述重疊的同一實體。
+        兩軌結果聯集後，透過「字面共字 + 相似度門檻」做程式端過濾，避免語義無關的條目被送進 LLM。
 
-        # 自動處理 'query: ' 前綴
-        query_vector = self.embed_func.embed_query(search_text)
-        
-        # 基礎過濾條件：小說 Hash 與 卷數限制
+        門檻參數（若未傳入則從 config 讀取）：
+          identity_strong: identity 純語義強配（直接放行）
+          identity_keep:   identity 中度語義 + 字面共字 才放行
+          content_strong:  content 描述強配（即使無字面共字也放行）
+          min_score:       content + 字面共字 的最低門檻
+        """
+        if not keyword:
+            return []
+
+        collection = self._client.collections.get("NovelEntity")
+
         base_filter = Filter.by_property("novel_hash").equal(novel_hash) & \
                       Filter.by_property("vol_num").less_or_equal(max_vol)
-        
-        # 第一階段：嘗試精準類型過濾 (Strict Pass)
         strict_filter = base_filter
         if entity_type:
-             strict_filter = strict_filter & Filter.by_property("entity_type").equal(entity_type)
+            strict_filter = strict_filter & Filter.by_property("entity_type").equal(entity_type)
 
+        bucket: Dict[str, Dict[str, Any]] = {}
+
+        # Track A：identity near_vector，查詢只用 keyword 本身，不混入情境摘要
         try:
-            # 第一波嘗試：Alpha=0.5 (平衡模式)
-            response = collection.query.hybrid(
-                query=search_text,
-                vector=query_vector,
-                target_vector="content",
-                alpha=0.5,
+            kw_vector = self.embed_func.embed_query(keyword)
+            resp_a = collection.query.near_vector(
+                near_vector=kw_vector,
+                target_vector="identity",
                 filters=strict_filter,
                 limit=top_k,
-                return_metadata=MetadataQuery(score=True)
+                return_metadata=MetadataQuery(distance=True)
             )
+            for obj in resp_a.objects:
+                dist = obj.metadata.distance if obj.metadata.distance is not None else 2.0
+                sim = max(0.0, 1.0 - dist / 2.0)  # cosine distance → [0,1] certainty
+                self._accumulate_candidate(bucket, obj, identity_sim=sim)
 
-            # 第二階段：若精準過濾沒結果，執行回退檢索 (Lenient Pass)
-            if not response.objects:
-                # 放寬搜尋：Alpha=0.3 (偏重關鍵字)，且不限 entity_type
-                response = collection.query.hybrid(
-                    query=search_text,
-                    vector=query_vector,
-                    target_vector="context",
-                    alpha=0.3,
+            # 放寬：若精準類型過濾沒命中，移除 type filter 再試一次 identity
+            if not bucket and entity_type:
+                resp_a2 = collection.query.near_vector(
+                    near_vector=kw_vector,
+                    target_vector="identity",
                     filters=base_filter,
                     limit=top_k,
-                    return_metadata=MetadataQuery(score=True)
+                    return_metadata=MetadataQuery(distance=True)
                 )
-
-            # 整理回傳格式
-            results = []
-            for obj in response.objects:
-                content_json = obj.properties.get("content", "{}")
-                data = json.loads(content_json)
-                data["_weaviate_uuid"] = str(obj.uuid)
-                data["_score"] = obj.metadata.score
-                results.append(data)
-            
-            return results
-
+                for obj in resp_a2.objects:
+                    dist = obj.metadata.distance if obj.metadata.distance is not None else 2.0
+                    sim = max(0.0, 1.0 - dist / 2.0)
+                    self._accumulate_candidate(bucket, obj, identity_sim=sim)
         except Exception as e:
-            # 最後保險：純向量檢索 (應對 Stopwords 報錯)
-            print(f"[Weaviate] Hybrid search failed ({e}), falling back to vector search...")
+            print(f"[Weaviate] Track A (identity) failed: {e}")
+
+        # Track B：content hybrid，查詢用情境摘要 + keyword 供 BM25 命中
+        summary = (query_summary or "").strip()[:400]
+        if summary:
             try:
-                response = collection.query.near_vector(
-                    near_vector=query_vector,
-                    target_vector="context",
-                    filters=base_filter,
+                content_query = f"{keyword} {summary}".strip()
+                content_vector = self.embed_func.embed_query(content_query)
+                resp_b = collection.query.hybrid(
+                    query=content_query,
+                    vector=content_vector,
+                    target_vector="content",
+                    alpha=0.5,
+                    filters=strict_filter,
                     limit=top_k,
                     return_metadata=MetadataQuery(score=True)
                 )
-                results = []
-                for obj in response.objects:
-                    content_json = obj.properties.get("content", "{}")
-                    data = json.loads(content_json)
-                    data["_weaviate_uuid"] = str(obj.uuid)
-                    data["_score"] = obj.metadata.score
-                    results.append(data)
-                return results
-            except Exception as e2:
-                print(f"[Weaviate] Critical error in search: {e2}")
-                return []
+                for obj in resp_b.objects:
+                    score = obj.metadata.score if obj.metadata.score is not None else 0.0
+                    self._accumulate_candidate(bucket, obj, content_sim=score)
+            except Exception as e:
+                print(f"[Weaviate] Track B (content) failed: {e}")
+
+        # 字面共字 + 相似度門檻過濾
+        IDENTITY_STRONG = identity_strong if identity_strong is not None else float(self.conf.get("rag_identity_strong", 0.75))
+        IDENTITY_KEEP   = identity_keep   if identity_keep   is not None else float(self.conf.get("rag_identity_keep",   0.62))
+        CONTENT_STRONG  = content_strong  if content_strong  is not None else float(self.conf.get("rag_content_strong",  0.35))
+        MIN_SCORE       = min_score       if min_score       is not None else float(self.conf.get("rag_content_min",     0.10))
+        kw_chars = set(keyword)
+
+        results: List[Dict[str, Any]] = []
+        for uuid_key, entry in bucket.items():
+            data = entry["data"]
+            id_sim = entry.get("identity_sim", 0.0)
+            content_sim = entry.get("content_sim", 0.0)
+
+            cand_names = [data.get("keyword", "")] + list(data.get("aliases") or [])
+            name_chars = set("".join(n for n in cand_names if isinstance(n, str)))
+            has_overlap = bool(kw_chars & name_chars)
+
+            match_track = None
+            score = 0.0
+            if id_sim >= IDENTITY_STRONG:
+                match_track, score = "identity-strong", id_sim
+            elif has_overlap and id_sim >= IDENTITY_KEEP:
+                match_track, score = "identity+literal", id_sim
+            elif has_overlap and content_sim >= MIN_SCORE:
+                match_track, score = "content+literal", content_sim
+            elif content_sim >= CONTENT_STRONG:
+                match_track, score = "content-strong", content_sim
+
+            if match_track is None:
+                continue
+
+            data["_score"] = score
+            data["_identity_sim"] = id_sim
+            data["_content_sim"] = content_sim
+            data["_match_track"] = match_track
+            results.append(data)
+
+        results.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
+        return results[:top_k]
+
+    def _accumulate_candidate(self, bucket: Dict[str, Dict[str, Any]], obj, identity_sim: float = None, content_sim: float = None):
+        """
+        以 uuid 為 key 合併兩軌檢索結果，同軌取較高分。
+        """
+        uuid_key = str(obj.uuid)
+        entry = bucket.get(uuid_key)
+        if entry is None:
+            content_json = obj.properties.get("content", "{}")
+            try:
+                data = json.loads(content_json)
+            except Exception:
+                data = {}
+            data["_weaviate_uuid"] = uuid_key
+            entry = {"data": data, "identity_sim": 0.0, "content_sim": 0.0}
+            bucket[uuid_key] = entry
+        if identity_sim is not None:
+            entry["identity_sim"] = max(entry["identity_sim"], identity_sim)
+        if content_sim is not None:
+            entry["content_sim"] = max(entry["content_sim"], content_sim)
 
     def upsert_entity(self, novel_hash: str, vol_num: int, data_dict: dict, existing_uuid: str = None, scene_idx: int = 0) -> str:
         """

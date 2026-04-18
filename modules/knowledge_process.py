@@ -44,10 +44,20 @@ class KnowledgeProcess:
             progress.update(tasks_ui["extract_task"], visible=True, description="[cyan]Extracting Entities from Scene...")
 
         existing_types = params.get("existing_types", [])
-        thought, result = self.agent.extract_entities(content, existing_types)
+        thought, result, prompt = self.agent.extract_entities(content, existing_types)
         
         if progress and tasks_ui:
             progress.update(tasks_ui["extract_task"], completed=100)
+
+        # [NEW LOG] 記錄 Step 1 提取結果與 Prompt
+        scene_idx = scene_data.get("scene_index", 0)
+        novel_hash = params.get("novel_hash")
+        self._save_log(novel_hash, f"scene_{scene_idx:03d}_extraction_step1_entities.json", {
+            "scene_index": scene_idx,
+            "prompt": prompt,
+            "thought": thought,
+            "result": result
+        })
 
         # 傳遞萃取到的條目到下一個步驟，同時也保留原始資料
         return {
@@ -73,6 +83,11 @@ class KnowledgeProcess:
         if progress and tasks_ui and entities:
             progress.update(tasks_ui["merge_task"], visible=True, total=len(entities), completed=0)
 
+        # 取得場景原文，作為給 LLM 的輔助脈絡
+        scene_content = scene_data.get("content", "")
+        # 截取前半段 (2000 字) 足以判斷身分的長度即可
+        scene_excerpt = scene_content[:2000] if scene_content else ""
+
         for i, entity in enumerate(entities):
             keyword = entity.get("keyword")
             e_type = entity.get("type", "world-setting")
@@ -85,13 +100,15 @@ class KnowledgeProcess:
                 progress.update(tasks_ui["merge_task"], description=f"[yellow]Merging Entity: {keyword} ({e_type})...")
 
             # [Top-K RAG] 從 Weaviate 檢索受限於相同小說與卷數的候選人
+            # 雙軌門檻走 config 預設 (rag_identity_strong/keep, rag_content_strong/min)
+            # 換模型或調試 LLM 自判能力時改 .env 即可，不必動程式
             candidates = self.weaviate_db.search_similar_entity(
                 novel_hash, vol_num, e_type, keyword, context, top_k=5
             )
 
             if not candidates:
                 # [全然新建]：完全沒找到候選人，直接初始化條目
-                thought, merged_result = self.agent.create_initial_entity(keyword, e_type, context, scene_idx)
+                thought, merged_result, prompt = self.agent.create_initial_entity(keyword, e_type, context, scene_idx, scene_excerpt=scene_excerpt)
             else:
                 # [合併決策]：進入 LLM 判斷與整合流程
                 llm_candidates = []
@@ -103,7 +120,7 @@ class KnowledgeProcess:
                     cand_copy.pop("appeared_in", None)
                     llm_candidates.append(cand_copy)
 
-                thought, merged_result = self.agent.merge_entity(keyword, e_type, context, llm_candidates, scene_idx)
+                thought, merged_result, prompt = self.agent.merge_entity(keyword, e_type, context, llm_candidates, scene_idx, scene_excerpt=scene_excerpt)
 
             if merged_result:
                 selected_idx = merged_result.get("selected_index", -1)
@@ -143,22 +160,30 @@ class KnowledgeProcess:
                 merged_data["type"] = e_type 
 
                 # 3. 寫入偵錯 Log
-                log_filename = f"scene_{scene_idx:03d}_merge_{keyword}_{hashlib.md5(str(existing_uuid or '').encode()).hexdigest()[:8]}.json"
+                log_prefix = "merge" if existing_uuid else "new"
+                log_filename = f"scene_{scene_idx:03d}_extraction_{log_prefix}_{keyword}_{hashlib.md5(str(existing_uuid or '').encode()).hexdigest()[:8]}.json"
                 self._save_log(novel_hash, log_filename, {
                     "scene_index": scene_idx,
                     "keyword": keyword,
                     "type": e_type,
                     "candidates_count": len(candidates),
+                    "rag_candidates": candidates,
+                    "full_prompt": prompt,
                     "thought": thought,
                     "result": merged_data,
                     "existing_uuid": existing_uuid
                 })
 
-                merged_entities.append({
-                    "keyword": merged_data["keyword"], # 使用最終確定的 Keyword
-                    "merged_data": merged_data,
-                    "existing_uuid": existing_uuid
-                })
+                # 最後防線：如果經過 LLM 處理後 keyword 仍然無效，則拒絕存入
+                final_kw = str(merged_data.get("keyword", "")).strip().upper()
+                if final_kw and final_kw not in ["N/A", "NONE", "NULL", ""]:
+                    merged_entities.append({
+                        "keyword": merged_data["keyword"], # 使用最終確定的 Keyword
+                        "merged_data": merged_data,
+                        "existing_uuid": existing_uuid
+                    })
+                else:
+                    self.console.print(f"[yellow]Warning: Skipped entity with invalid keyword: '{keyword}'[/yellow]")
 
             if progress and tasks_ui:
                 progress.update(tasks_ui["merge_task"], advance=1)
@@ -240,13 +265,18 @@ class KnowledgeProcess:
         
         novel_hash = self.get_path_hash(base_data_path)
 
-        # --clean 機制: 這裡如果是 clean，是否清空 world 庫？
+        # --clean 機制: 這裡如果是 clean，是否清空 world 與 logs 庫？
         if clean_output:
             import shutil
             world_dir = os.path.join("output", novel_hash, "world")
             if os.path.exists(world_dir):
                 shutil.rmtree(world_dir)
                 self.console.print(f"[yellow]已清除 World Knowledge 目錄: {world_dir}[/yellow]")
+            
+            log_dir = os.path.join("output", novel_hash, "logs", "extraction")
+            if os.path.exists(log_dir):
+                shutil.rmtree(log_dir)
+                self.console.print(f"[yellow]已清除 Extraction Logs 目錄: {log_dir}[/yellow]")
 
         self.console.print(f"\n[bold magenta]>> 開始知識提取: {novel_name}[/bold magenta] (Hash: {novel_hash})")
 

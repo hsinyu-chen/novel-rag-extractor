@@ -18,6 +18,11 @@ class PipelineConfig:
     weaviate_http_secure: bool
     weaviate_grpc_port: int
     weaviate_grpc_secure: bool
+    # 條目去重雙軌檢索門檻 (Track A/B pre-LLM gate)
+    rag_identity_strong: float
+    rag_identity_keep: float
+    rag_content_strong: float
+    rag_content_min: float
 
 class ConfigService:
     """
@@ -49,5 +54,11 @@ class ConfigService:
             weaviate_http_port=int(os.getenv("WEAVIATE_HTTP_PORT", 8080)),
             weaviate_http_secure=os.getenv("WEAVIATE_HTTP_SECURE", "False").lower() == "true",
             weaviate_grpc_port=int(os.getenv("WEAVIATE_GRPC_PORT", 50051)),
-            weaviate_grpc_secure=os.getenv("WEAVIATE_GRPC_SECURE", "False").lower() == "true"
+            weaviate_grpc_secure=os.getenv("WEAVIATE_GRPC_SECURE", "False").lower() == "true",
+
+            # 雙軌檢索閘門門檻 (預設偏寬鬆，方便觀察 LLM 自判能力；需要收緊時改 .env 即可)
+            rag_identity_strong=float(os.getenv("RAG_IDENTITY_STRONG", 0.75)),
+            rag_identity_keep=float(os.getenv("RAG_IDENTITY_KEEP", 0.62)),
+            rag_content_strong=float(os.getenv("RAG_CONTENT_STRONG", 0.35)),
+            rag_content_min=float(os.getenv("RAG_CONTENT_MIN", 0.10))
         )

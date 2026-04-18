@@ -19,17 +19,19 @@
 ### 屬性定義 (Properties)
 | 屬性名稱          | 型別 (DataType)       | 說明與防呆機制 |
 |-------------------|----------------------|----------------|
-| `novel_hash`      | `TEXT`               | 雜湊過的小說編號，做為租戶隔離，查詢時必加 Filter。<br/>*配置 `skip_vectorization=True`* |
+| `novel_hash`      | `TEXT`               | 雜湊過的小說編號，做為租戶隔離，查詢時必加 Filter。<br/>*配置 `skip_vectorization=True`，Tokenization `FIELD`* |
 | `vol_num`         | `INT`                | 該屬性屬於哪一集的資訊快照設定。 |
-| `entity_type`     | `TEXT`               | 例如 `character`, `item`, `poi`, `world-setting`。<br/>*使用 `Tokenization.GSE` 中文分詞器* |
-| `keyword`         | `TEXT`               | 核心 Canonical Name。<br/>*使用 `Tokenization.GSE` 中文分詞器* |
-| `aliases`         | `TEXT_ARRAY` (陣列)  | 蒐羅所有代稱與方言。<br/>*使用 `Tokenization.GSE` 中文分詞器* |
-| `description`     | `TEXT`               | 豐富的文本描述（含外觀、性格、功能等關鍵設定）。<br/>*使用 `Tokenization.GSE` 中文分詞器* |
+| `entity_type`     | `TEXT`               | 例如 `character`, `item`, `poi`, `world-setting`。<br/>*Tokenization `FIELD`（整串視為單一 token，供精準 filter 使用）* |
+| `keyword`         | `TEXT`               | 核心 Canonical Name。<br/>*Tokenization `FIELD`，BM25/語義比對交由 `identity` 向量處理* |
+| `aliases`         | `TEXT_ARRAY` (陣列)  | 蒐羅所有代稱與方言。<br/>*Tokenization `FIELD`，供 `filter_categories`-類別的精準匹配與 `identity` 向量編碼* |
+| `categories`      | `TEXT_ARRAY` (陣列)  | 標籤分類，例如 `["劍", "武器"]`。<br/>*Tokenization `FIELD`，100% 精準匹配「列出所有劍」這類列舉需求* |
+| `description`     | `TEXT`               | 豐富的文本描述（含外觀、性格、功能等關鍵設定）。<br/>*Tokenization `GSE` 中文分詞器，供 hybrid BM25 模糊檢索* |
 | `appeared_in`     | `INT_ARRAY` (陣列)   | 實體曾在哪些分片（Scene ID）中被提及。由程式碼維護。 |
 | `content`         | `TEXT`               | 該實體完整的極簡 JSON 字串備份。<br/>*配置 `skip_vectorization=True`* |
 
-> 💡 **中文分詞技術細節**：
-> 包含 `aliases` 在內的所有可搜尋文字皆掛上了 **GSE (Go Segmenter)** 分詞器，解決了 Weaviate 中文長字串被視為單一 Token 的缺陷。
+> 💡 **分詞器選擇原則**：
+> - `description` 掛 **GSE (Go Segmenter)** 中文分詞，支援 BM25 全文模糊檢索。
+> - `keyword` / `aliases` / `categories` / `entity_type` 皆用 `FIELD`（整串當一個 token），精準過濾不被切詞干擾，而其語義相似度由 `identity` 向量全權負責。
 
 ---
 
@@ -37,6 +39,32 @@
 
 1. **`identity` 向量**：利用 `keyword` 與 `aliases` 計算。專門用來找人/物。
 2. **`content` 向量**：利用完整的 `description` 與 `major_status_changes` 計算，專門處理模糊語義提問（如：外觀描述、性格特徵）。
+
+### 3.2 條目去重的雙軌檢索協定 (Dual-Track Dedup Retrieval)
+
+為了避免「名字」與「情境描述」互相污染，`search_similar_entity` 嚴格分兩條獨立軌道檢索候選人，再以「字面共字 + 相似度門檻」做程式端過濾，最後才丟給 LLM 做決策：
+
+1. **Track A — Identity 名字軌 (純向量)**
+   * 查詢文本**只用 `keyword` 本身**（不混入情境摘要，避免 BM25 被情境字眼拉偏）。
+   * 走 `near_vector` 對 `identity` 向量做 cosine 比對，回傳 `distance` 並換算成 `[0,1]` 相似度。
+   * 若精準類型 filter 無結果，移除 `entity_type` 過濾再試一次。
+
+2. **Track B — Content 描述軌 (Hybrid)**
+   * 查詢文本 = `keyword + query_summary`，走 `hybrid` 對 `content` 向量做 BM25+Vector 融合（`alpha=0.5`）。
+   * 專門抓「別名未註冊、但描述高度重疊」的同一實體。
+
+3. **程式端閘門 (Pre-LLM Gate)**
+   以 UUID 聯集兩軌結果後，依下列優先序決定是否放行：
+
+   | 條件 | 採用原因 |
+   |------|----------|
+   | `identity_sim ≥ 0.85` | 純語義已近似同名，直接放行。 |
+   | `identity_sim ≥ 0.75` 且候選名稱與輸入 keyword 有字面共字 | 避免同音近似但不同物（雙重保險）。 |
+   | `content_sim ≥ min_score` 且有字面共字 | 描述有吻合、名字也沾邊，值得交 LLM 判斷。 |
+   | `content_sim ≥ 0.45` | 描述極度吻合，即使名字毫無關聯也放行（例如隱藏身份橋段）。 |
+   | 其他 | **程式端直接剔除，不送給 LLM，防範望文生義的誤合併。** |
+
+> 📌 **為什麼要程式端過濾？** 先前曾出現「劍」被 RAG 匹配到「儲倉」分數 0.5 的案例。根因是 Weaviate hybrid score 是 RRF 融合值，在小資料庫下排第一就近 0.5，與實際語義無關。新協定用真餘弦相似度把關，並以字面共字做硬閘門。
 
 ### 3.3 知識提取與決策分流 (Branching Decision Logic)
 為了提高效率並防止邏輯混亂，系統在處理新條目時會根據 Weaviate 的檢索結果進行分流：
@@ -126,7 +154,7 @@
    * **運作**：LLM 填入 `query_text="男主 詛咒聖劍 城堡"`。Python 開啟 e5 的 Vector 進行語義強算抓取。
 2. **精準條件過濾 (Metadata Category Filter)**
    * **情境**：「這本書出現了哪些劍？」
-   * **運作**：LLM 填入 `filter_type="item", filter_categories=["劍"]`。由於 `categories` 掛載了 GSE 中文分詞，立刻 100% 取回對應物件。
+   * **運作**：LLM 填入 `filter_type="item", filter_categories=["劍"]`。由於 `categories` 採用 `FIELD` tokenization（整串當一個 token），可直接用 `Filter.contains_any` 做 100% 精準匹配，不會被中文分詞誤切。
 3. **統計列舉功能 (List & Sort Fetching)**
    * **情境**：「請列出這本小說裡出場次數最高的主要人物前五名。」
    * **運作**：LLM 取巧判斷不需語意，傳入 `query_text="", filter_type="character", sort_by="appearances", limit=5`。Python 後端偵測到文字留空，**不走 Vector**，直接化身傳統 Database 叫出資料，並以 `appeared_in` 的涵蓋廣度作為主角排名指標，輕鬆解決大模型的計數弱點。
