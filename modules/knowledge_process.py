@@ -193,18 +193,82 @@ class KnowledgeProcess:
                     existing_aliases = old_obj.get("aliases", [])
                     merged_data["aliases"] = list(set((merged_data.get("aliases") or []) + existing_aliases))
 
-                    # [狀態變更整合]：聯集舊實體的狀態記錄
-                    existing_status = old_obj.get("major_status_changes", [])
-                    new_status = merged_data.get("major_status_changes", [])
-                    # 以 scene_index + event 作為唯一性判斷 (簡單過濾)
-                    combined_status = existing_status + [ns for ns in new_status if ns not in existing_status]
-                    merged_data["major_status_changes"] = sorted(combined_status, key=lambda x: x.get("scene_index", 0))
+                    # [狀態變更整合]：保留舊實體狀態記錄，本 scene 新條目只取第一筆
+                    # 同 scene 的新舊條目視為同一事件（LLM 偶有重複輸出，以 scene_index 去重）
+                    existing_status = list(old_obj.get("major_status_changes", []) or [])
+                    existing_scene_idxs = {s.get("scene_index") for s in existing_status}
+                    new_status = merged_data.get("major_status_changes", []) or []
+                    appended = []
+                    appended_scenes = set()
+                    for ns in new_status:
+                        s_idx = ns.get("scene_index")
+                        if s_idx in existing_scene_idxs or s_idx in appended_scenes:
+                            continue
+                        appended.append(ns)
+                        appended_scenes.add(s_idx)
+                    merged_data["major_status_changes"] = sorted(
+                        existing_status + appended, key=lambda x: x.get("scene_index", 0)
+                    )
 
-                # 2. 清理與標準化
+                    # [Canonical type 鎖定]：舊條目已有有效 type 就沿用，避免同實體因
+                    # LLM 分類搖擺在 Weaviate 上跳動、在本地 JSON 產生孤兒檔。
+                    # 新提取到的 type 若與舊不同，改塞進 categories 作輔助標籤。
+                    old_type = (old_obj.get("type") or "").strip()
+                    if old_type:
+                        if e_type and e_type != old_type:
+                            extra_cats = list(merged_data.get("categories") or [])
+                            if e_type not in extra_cats:
+                                extra_cats.append(e_type)
+                            merged_data["categories"] = extra_cats
+                        e_type = old_type
+
+                # 2. 失效偵測（超級磁鐵防線）
+                # 結構性訊號：別名爆炸 / 描述爆炸 → 視為此條目已被污染，標記失效後
+                # 不再進入 RAG 檢索池與 merge 候選池，避免雪球繼續滾大。後續可由 2-pass
+                # 工具掃描 tainted=True 的條目並拆分重建。
+                taint_reasons = []
+                alias_cap = int(self.conf.get("entity_alias_cap", 8))
+                desc_cap = int(self.conf.get("entity_description_cap", 800))
+                semantic_gate = float(self.conf.get("entity_semantic_gate", 0.75))
+
+                final_aliases = merged_data.get("aliases", []) or []
+                final_desc = merged_data.get("description", "") or ""
+                if len(final_aliases) > alias_cap:
+                    taint_reasons.append(f"alias_overflow({len(final_aliases)}>{alias_cap})")
+                if len(final_desc) > desc_cap:
+                    taint_reasons.append(f"description_overflow({len(final_desc)}>{desc_cap})")
+
+                # Semantic gate：新舊 keyword 語意距離過大時，表示這次 merge 本身就可疑
+                # （例：「流星雨」被併進「清醒夢」）。純 embedding 判斷，跨語言/題材通用。
+                if selected_idx >= 0 and selected_idx < len(candidates):
+                    old_kw = (candidates[selected_idx].get("keyword") or "").strip()
+                    new_kw = (keyword or "").strip()
+                    if old_kw and new_kw and old_kw != new_kw:
+                        try:
+                            vecs = self.weaviate_db.embed_func.embed_documents([new_kw, old_kw])
+                            v1, v2 = vecs[0], vecs[1]
+                            dot = sum(a * b for a, b in zip(v1, v2))
+                            n1 = (sum(a * a for a in v1) ** 0.5) or 1e-8
+                            n2 = (sum(a * a for a in v2) ** 0.5) or 1e-8
+                            cos = dot / (n1 * n2)
+                            if cos < semantic_gate:
+                                taint_reasons.append(f"weak_semantic_merge({cos:.2f}<{semantic_gate}:{old_kw}|{new_kw})")
+                        except Exception as gate_err:
+                            self.console.print(f"[yellow]Semantic gate error for '{keyword}': {gate_err}[/yellow]")
+
+                if taint_reasons:
+                    merged_data["tainted"] = True
+                    merged_data["tainted_reason"] = ", ".join(taint_reasons)
+                    self.console.print(f"[magenta]Tainted entity '{merged_data.get('keyword', keyword)}': {merged_data['tainted_reason']}[/magenta]")
+                else:
+                    merged_data["tainted"] = False
+                    merged_data["tainted_reason"] = ""
+
+                # 3. 清理與標準化
                 merged_data.pop("selected_index", None)
-                merged_data["type"] = e_type 
+                merged_data["type"] = e_type
 
-                # 3. 寫入偵錯 Log
+                # 4. 寫入偵錯 Log
                 log_prefix = "merge" if existing_uuid else "new"
                 log_filename = f"scene_{scene_idx:03d}_extraction_{log_prefix}_{keyword}_{hashlib.md5(str(existing_uuid or '').encode()).hexdigest()[:8]}.json"
                 self._save_log(novel_hash, log_filename, {
@@ -297,6 +361,10 @@ class KnowledgeProcess:
             uuid_key = entity_info["uuid"]
             e_type = entity_info["type"]
 
+            # 孤兒檔清理：同 UUID 若曾被寫進其他 type 資料夾（舊版分類或資料回溯），
+            # 移除非當前 canonical type 的殘留，確保本地 JSON 與 Weaviate 一致。
+            self._cleanup_orphan_entity_files(novel_hash, vol_num, uuid_key, e_type)
+
             # 本機 JSON 備份（以 UUID 為檔名）
             local_key = f"{novel_hash}.world.vol_{vol_num}.{e_type}.{uuid_key}"
             self.storage.set(local_key, entity_info["merged_data"])
@@ -317,6 +385,25 @@ class KnowledgeProcess:
             progress.update(tasks_ui["save_task"], completed=100)
 
         return data
+
+    def _cleanup_orphan_entity_files(self, novel_hash: str, vol_num: int, uuid_key: str, canonical_type: str):
+        """
+        移除同 UUID 在非 canonical_type 資料夾下的殘留 JSON。
+        當 entity 的 type 收斂 (例如多次分類搖擺後鎖定 canonical type) 時避免堆積孤兒檔。
+        """
+        vol_root = os.path.join("output", novel_hash, "world", f"vol_{vol_num}")
+        if not os.path.isdir(vol_root):
+            return
+        target_filename = f"{uuid_key}.json"
+        for type_dir in os.listdir(vol_root):
+            if type_dir == canonical_type:
+                continue
+            candidate = os.path.join(vol_root, type_dir, target_filename)
+            if os.path.isfile(candidate):
+                try:
+                    os.remove(candidate)
+                except OSError as e:
+                    self.console.print(f"[yellow]Failed to remove orphan {candidate}: {e}[/yellow]")
 
     def _save_log(self, novel_hash: str, filename: str, log_data: Any):
         """

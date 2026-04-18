@@ -2,6 +2,8 @@
 
 本專案利用 **Weaviate (v4)** 向量資料庫與 **Gemma 4** 語言模型，打造具備「條目去重」、「分卷快照功能」以及「多重命名向量」的小說 RAG Agent 系統。
 
+硬體目標為8GB VRAM的設備
+
 以下為目前的向量庫與儲存架構規劃指南：
 
 ## 1. 核心概念 (Core Concepts)
@@ -46,7 +48,7 @@ Named Vectors (BYOV)：
 |-------------------|----------------------|----------------|
 | `novel_hash`      | `TEXT`               | 雜湊過的小說編號，做為租戶隔離，查詢時必加 Filter。<br/>*配置 `skip_vectorization=True`，Tokenization `FIELD`* |
 | `vol_num`         | `INT`                | 該屬性屬於哪一集的資訊快照設定。 |
-| `entity_type`     | `TEXT`               | 例如 `character`, `item`, `poi`, `world-setting`。<br/>*Tokenization `FIELD`（整串視為單一 token，供精準 filter 使用）* |
+| `entity_type`     | `TEXT`               | 受控四類：`character`, `location`, `object`, `concept`。細分標籤推進 `categories`。<br/>*Tokenization `FIELD`（整串視為單一 token，供精準 filter 使用）* |
 | `keyword`         | `TEXT`               | 核心 Canonical Name。<br/>*Tokenization `FIELD`，BM25/語義比對交由 `identity` 向量處理* |
 | `aliases`         | `TEXT_ARRAY` (陣列)  | 蒐羅所有代稱與方言。<br/>*Tokenization `FIELD`，供 `filter_categories`-類別的精準匹配與 `identity` 向量編碼* |
 | `categories`      | `TEXT_ARRAY` (陣列)  | 標籤分類，例如 `["劍", "武器"]`。<br/>*Tokenization `FIELD`，100% 精準匹配「列出所有劍」這類列舉需求* |
@@ -54,6 +56,8 @@ Named Vectors (BYOV)：
 | `appeared_in`     | `INT_ARRAY` (陣列)   | 實體曾在哪些分片（Scene ID）中被提及。由程式碼維護。 |
 | `chunk_refs`      | `TEXT_ARRAY` (陣列)  | 指回 Layer 1 (`NovelChunk`) 的 UUID 清單。由程式碼 union 維護。<br/>*配置 `skip_vectorization=True`，Tokenization `FIELD`* |
 | `content`         | `TEXT`               | 該實體完整的極簡 JSON 字串備份。<br/>*配置 `skip_vectorization=True`* |
+| `tainted`         | `BOOL`               | 失效旗標。為 `True` 時此條目被視為「超級磁鐵」，自動退出 RAG 檢索池與 merge 候選池。<br/>*配置 `skip_vectorization=True`* |
+| `tainted_reason`  | `TEXT`               | 失效觸發原因（結構性訊號彙總），供後續 2-pass 工具診斷與重建。<br/>*配置 `skip_vectorization=True`，Tokenization `FIELD`* |
 
 > 💡 **分詞器選擇原則**：
 > - `description` 掛 **GSE (Go Segmenter)** 中文分詞，支援 BM25 全文模糊檢索。
@@ -112,6 +116,12 @@ Named Vectors (BYOV)：
 3. **重大狀態變更整合 (Status Aggregation)**：自動合併並按場景順序排列 `major_status_changes`。
 4. **場景追蹤 (`appeared_in`)**：由程式碼嚴格維護，記錄實體曾在哪一卷、哪一場景出現過。
 5. **Chunk 追蹤 (`chunk_refs`)**：由程式碼 union 維護，新 chunk UUID 會併入既有清單，合併兩實體時保留舊實體的 chunk_refs。
+6. **失效偵測護欄 (Taint Detection)**：合併完成後，以三組**純結構性/純向量**訊號自動標記「超級磁鐵」條目（例如「清醒夢」吸附了所有技能、魔法、系統事件）：
+   - `aliases` 數量超過 `entity_alias_cap` (預設 8) → 別名爆炸
+   - `description` 字數超過 `entity_description_cap` (預設 800) → 描述爆炸
+   - Merge 當下，新舊 keyword 的 e5 向量 cosine 低於 `entity_semantic_gate` (預設 0.75) → 語意跳躍式合併
+
+   任一觸發即寫入 `tainted=True` 與具體 `tainted_reason`。被標記的條目不再出現在後續 RAG 檢索與 merge 候選池中，停止雪球滾動。**不靠任何特定關鍵字清單**，跨題材/跨語言通用。完整拆分重建交由未來的 2-pass 後處理工具（依 alias 語義聚類拆分 → 重分配 `chunk_refs` → 刪除原 tainted 條目）。
 
 ### 3.4 Per-Scene LCEL Pipeline
 
@@ -186,7 +196,7 @@ save_scene_json       → 寫 `world/<type>/<uuid>.json` 與 augment `scene_XXX.
 ```json
 {
   "query_text": "語意搜尋與 BM25 關鍵字用。例：'長得像精靈的女孩'。（單純列出時可留空不傳）",
-  "filter_type": "可選：character, item, poi, world-setting",
+  "filter_type": "可選：character, location, object, concept",
   "filter_categories": "可選：用標籤陣列做精準檢索。例：['劍']",
   "sort_by": "可選：'relevance' (預設), 'appearances' (依出場數排序，找尋主角/主要設定)",
   "limit": "筆數上限 (List 列舉功能必用)"
@@ -201,7 +211,7 @@ save_scene_json       → 寫 `world/<type>/<uuid>.json` 與 augment `scene_XXX.
    * **運作**：LLM 填入 `query_text="男主 詛咒聖劍 城堡"`。Python 開啟 e5 的 Vector 進行語義強算抓取。
 2. **精準條件過濾 (Metadata Category Filter)**
    * **情境**：「這本書出現了哪些劍？」
-   * **運作**：LLM 填入 `filter_type="item", filter_categories=["劍"]`。由於 `categories` 採用 `FIELD` tokenization（整串當一個 token），可直接用 `Filter.contains_any` 做 100% 精準匹配，不會被中文分詞誤切。
+   * **運作**：LLM 填入 `filter_type="object", filter_categories=["劍"]`。由於 `categories` 採用 `FIELD` tokenization（整串當一個 token），可直接用 `Filter.contains_any` 做 100% 精準匹配，不會被中文分詞誤切。
 3. **統計列舉功能 (List & Sort Fetching)**
    * **情境**：「請列出這本小說裡出場次數最高的主要人物前五名。」
    * **運作**：LLM 取巧判斷不需語意，傳入 `query_text="", filter_type="character", sort_by="appearances", limit=5`。Python 後端偵測到文字留空，**不走 Vector**，直接化身傳統 Database 叫出資料，並以 `appeared_in` 的涵蓋廣度作為主角排名指標，輕鬆解決大模型的計數弱點。

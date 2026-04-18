@@ -61,7 +61,9 @@ class WeaviateStorage:
                     Property(name="appeared_in", data_type=DataType.INT_ARRAY),
                     Property(name="chunk_refs", data_type=DataType.TEXT_ARRAY, skip_vectorization=True, tokenization=Tokenization.FIELD),
                     Property(name="description", data_type=DataType.TEXT, tokenization=Tokenization.GSE),
-                    Property(name="content", data_type=DataType.TEXT, skip_vectorization=True)
+                    Property(name="content", data_type=DataType.TEXT, skip_vectorization=True),
+                    Property(name="tainted", data_type=DataType.BOOL, skip_vectorization=True),
+                    Property(name="tainted_reason", data_type=DataType.TEXT, skip_vectorization=True, tokenization=Tokenization.FIELD)
                 ],
                 # 宣告多組獨立向量空間 (BYOV 模式)
                 vectorizer_config=[
@@ -114,7 +116,10 @@ class WeaviateStorage:
         content_text = f"{description}{status_text}"
 
         # 這裡的 embed_documents 會自動在前面幫我們加上 'passage: '
-        vecs = self.embed_func.embed_documents([identity_text, content_text])
+        vecs = self.embed_func.embed_documents([
+            self._truncate_for_embedding(identity_text),
+            self._truncate_for_embedding(content_text),
+        ])
         return {
             "identity": vecs[0],
             "content": vecs[1]
@@ -138,8 +143,10 @@ class WeaviateStorage:
 
         collection = self._client.collections.get("NovelEntity")
 
+        # 排除被標記失效的條目（超級磁鐵），避免污染 RAG 候選池與未來 merge
         base_filter = Filter.by_property("novel_hash").equal(novel_hash) & \
-                      Filter.by_property("vol_num").less_or_equal(max_vol)
+                      Filter.by_property("vol_num").less_or_equal(max_vol) & \
+                      Filter.by_property("tainted").not_equal(True)
         strict_filter = base_filter
         if entity_type:
             strict_filter = strict_filter & Filter.by_property("entity_type").equal(entity_type)
@@ -292,6 +299,8 @@ class WeaviateStorage:
             "categories": data_dict.get("categories", []),
             "appeared_in": appeared_in,
             "chunk_refs": chunk_refs,
+            "tainted": bool(data_dict.get("tainted", False)),
+            "tainted_reason": str(data_dict.get("tainted_reason", "") or ""),
             "content": json.dumps(data_dict, ensure_ascii=False)
         }
 
@@ -320,14 +329,38 @@ class WeaviateStorage:
         key = f"{novel_hash}:vol{vol_num}:scene{scene_idx}"
         return str(uuid.uuid5(_CHUNK_UUID_NAMESPACE, key))
 
+    def _truncate_for_embedding(self, text: str, max_tokens: int = 500) -> str:
+        """
+        把輸入壓在 e5-large / llama-server 的 physical batch size 內。
+        保留 "passage: "/"query: " 前綴的 token 開銷，預留 12 token 緩衝。
+        """
+        if not text:
+            return ""
+        tokenize = getattr(self.embed_func, "tokenize", None)
+        if tokenize is None:
+            return text[:max_tokens]
+        n_tokens = tokenize(text)
+        if n_tokens <= max_tokens:
+            return text
+        ratio = len(text) / max(n_tokens, 1)
+        target_chars = max(1, int(max_tokens * ratio * 0.9))
+        truncated = text[:target_chars]
+        for _ in range(3):
+            if tokenize(truncated) <= max_tokens:
+                return truncated
+            target_chars = max(1, int(target_chars * 0.85))
+            truncated = text[:target_chars]
+        return truncated
+
     def _generate_chunk_vectors(self, title: str, content: str) -> Dict[str, List[float]]:
         """
         Layer 1 雙向量：
-          full_text：整段原文（e5-large 截斷前 512 tokens）
+          full_text：整段原文截斷到 e5-large 的 512 token 上限
           summary：scene 的 title 欄位（LLM 生成的摘要）
+        原始完整 content 仍存於 Weaviate 的 content 欄位，截斷僅影響向量輸入。
         """
-        full_text = content or ""
-        summary_text = title or ""
+        full_text = self._truncate_for_embedding(content or "")
+        summary_text = self._truncate_for_embedding(title or "")
         vecs = self.embed_func.embed_documents([full_text, summary_text])
         return {
             "full_text": vecs[0],
@@ -407,7 +440,7 @@ class WeaviateStorage:
             types = [g.grouped_by.value for g in res.groups]
             return [t for t in types if t and isinstance(t, str)]
         except Exception as e:
-            return ["character", "item", "poi", "world-setting"]
+            return ["character", "location", "object", "concept"]
 
     def close(self):
         if self._client:
