@@ -1,39 +1,58 @@
 import json
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Callable
 from processor.llm_engine import NativeLlamaEngine
 
 class KnowledgeAgent:
     """
     Agentic LLC 工具庫
-    負責：提取文本條目、與現有條目進行合併 (基於 JSON Schema)
+    負責：提取文本條目、根據 Top-K 候選人決策合併或新建條目。
+    具備自動驗證與重試機制。
     """
     def __init__(self, engine: NativeLlamaEngine):
         self.engine = engine
 
-    def _call_with_schema(self, messages: List[Dict[str, str]], schema: dict) -> Tuple[str, dict]:
+    def _call_with_schema(self, 
+                         messages: List[Dict[str, str]], 
+                         schema: dict, 
+                         validator: Callable[[dict], bool] = None,
+                         max_retries: int = 3) -> Tuple[str, dict]:
         """
-        透過 JSON Schema 保證格式正確，不需重試機制
+        透過 JSON Schema 保證格式，並加入 3 次重試與自定義邏輯驗證。
         """
-        thought, json_str = self.engine.call_llm(messages, response_schema=schema)
-        
-        if not json_str:
-            return thought, {}
+        last_thought = ""
+        for attempt in range(max_retries):
+            # 獲取 LLM 回應
+            thought, json_str = self.engine.call_llm(messages, response_schema=schema)
+            last_thought = thought
             
-        try:
-            parsed_data = json.loads(json_str)
-            return thought, parsed_data
-        except json.JSONDecodeError as e:
-            print(f"[KnowledgeAgent] JSON Parse failed: {str(e)}")
-            return thought, {}
+            if not json_str:
+                print(f"[KnowledgeAgent] Attempt {attempt+1}: Empty response, retrying...")
+                continue
+                
+            try:
+                data = json.loads(json_str)
+                
+                # 執行語意/邏輯驗證
+                if validator:
+                    if not validator(data):
+                        print(f"[KnowledgeAgent] Attempt {attempt+1}: Validation failed, retrying...")
+                        continue
+                
+                return thought, data
+            except json.JSONDecodeError as e:
+                print(f"[KnowledgeAgent] Attempt {attempt+1}: JSON Parse failed ({str(e)}), retrying...")
+                continue
+        
+        print(f"[KnowledgeAgent] All {max_retries} attempts failed.")
+        return last_thought, {}
 
     def extract_entities(self, scene_content: str, existing_types: List[str] = None) -> Tuple[str, dict]:
         """
         LCEL Step 1: 條目提取
         """
-        type_description = "請依常理自行判斷英文單詞 (例如: character, item, poi, faction, magic, spell 等)。重要：若是個人物，請務必填寫 'character'"
-        if existing_types:
-            type_description = f"請盡量從資料庫已存的類型中挑選適合的 ({', '.join(existing_types)})，若都不適合再自行發明新類別。若是常規人物請填寫 'character'"
-
+        base_types = ["character", "item", "poi", "faction", "magic", "skill", "event", "artifact", "world-setting"]
+        all_types = list(set(base_types + (existing_types or [])))
+        
         schema = {
             "type": "object",
             "properties": {
@@ -42,11 +61,11 @@ class KnowledgeAgent:
                     "items": {
                         "type": "object",
                         "properties": {
-                            "keyword": {"type": "string", "description": "條目名稱"},
-                            "aliases": {"type": "array", "items": {"type": "string"}, "description": "別名、代稱或簡稱。若無請留空陣列"},
-                            "categories": {"type": "array", "items": {"type": "string"}, "description": "條目標籤。如人物可寫 ['種族', '職業']，武器可寫 ['劍']"},
-                            "type": {"type": "string", "description": type_description},
-                            "context_summary": {"type": "string", "description": "對該條目在此場景中的表現或描述總結"}
+                            "keyword": {"type": "string"},
+                            "aliases": {"type": "array", "items": {"type": "string"}},
+                            "categories": {"type": "array", "items": {"type": "string"}},
+                            "type": {"type": "string", "enum": all_types},
+                            "context_summary": {"type": "string"}
                         },
                         "required": ["keyword", "aliases", "categories", "type", "context_summary"],
                         "additionalProperties": False
@@ -57,18 +76,30 @@ class KnowledgeAgent:
             "additionalProperties": False
         }
         
-        messages = [
-            {"role": "system", "content": (
-                "你是一個專業的小說分析專家。你的任務是從這段劇情中萃取出所有有意義的條目，包含人物、地點、物品、世界設定等。\n"
-                "注意：如果這段沒有條目，請回傳空的 entities 陣列：{\"entities\": []}"
-            )},
-            {"role": "user", "content": f"【目前場景內容】：\n{scene_content[:4000]}\n\n請提取該片段的人物及關鍵條目，並以 JSON 輸出："}
-        ]
-        return self._call_with_schema(messages, schema)
+        types_str = ", ".join(all_types)
+        system_prompt = (
+            "你是一個專業的小說分析專家。請從文本中提取關鍵條目。準則：\n"
+            "1. **禁止提取現實世界事物**：如「日本」、「東京」等。\n"
+            "2. **使用原文名稱**：Keyword 必須是小說文本中的官方稱呼或代號。\n"
+            "3. **人物命名**：有名用名，無名用「未知人物A」、「未知人物B」。\n"
+            "4. **繁體中文**：所有輸出內容必須使用正體/繁體中文。\n"
+            "5. **分類參考**：盡量使用現有類別：" + types_str + "\n"
+            "6. **人物強制**：如果是人物，必須為 'character'。"
+        )
 
-    def merge_character(self, keyword: str, new_context: str, existing_data: dict, current_scene_index: int) -> Tuple[str, dict]:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"【目前場景內容】：\n{scene_content[:4000]}\n\n請提取條目："}
+        ]
+        
+        def validator(data):
+            return isinstance(data.get("entities"), list)
+
+        return self._call_with_schema(messages, schema, validator=validator)
+
+    def create_initial_entity(self, keyword: str, entity_type: str, new_context: str, current_scene_index: int) -> Tuple[str, dict]:
         """
-        專屬於 Character 的合併邏輯
+        Step 2 - 分流 A: 初始化全然新條目 (極簡結構)
         """
         schema = {
             "type": "object",
@@ -76,21 +107,9 @@ class KnowledgeAgent:
                 "keyword": {"type": "string"},
                 "aliases": {"type": "array", "items": {"type": "string"}},
                 "categories": {"type": "array", "items": {"type": "string"}},
-                "type": {"type": "string", "enum": ["character"]},
-                "profile": {
-                    "type": "object",
-                    "properties": {
-                        "action_principles": {"type": "string"},
-                        "personality": {"type": "string"},
-                        "appearance": {"type": "string"},
-                        "clothing": {"type": "string"},
-                        "equipment": {"type": "string"}
-                    },
-                    "required": ["action_principles", "personality", "appearance", "clothing", "equipment"],
-                    "additionalProperties": False
-                },
-                "last_known_location": {"type": "string"},
-                "turning_points": {
+                "type": {"type": "string"},
+                "description": {"type": "string"},
+                "major_status_changes": {
                     "type": "array",
                     "items": {
                         "type": "object",
@@ -103,53 +122,93 @@ class KnowledgeAgent:
                     }
                 }
             },
-            "required": ["keyword", "aliases", "categories", "type", "profile", "last_known_location", "turning_points"],
+            "required": ["keyword", "aliases", "categories", "type", "description", "major_status_changes"],
             "additionalProperties": False
         }
-        
-        system_prompt = (
-            "你是一個人物檔案管理員。你需要將「新場景中獲得的人物情報」合併進「現存的人物檔案」中。\n"
-            "你必須維護並輸出一份完整的角色 JSON 檔案，確保豐富各項欄位與保留舊有資料。"
-        )
 
-        user_content = f"【現存檔案】：\n{json.dumps(existing_data, ensure_ascii=False) if existing_data else '完全沒有，這是一個新角色。'}\n\n"
-        user_content += f"【新場景情報 (Scene {current_scene_index})】：\n{new_context}\n\n"
-        user_content += "請進行資訊融合，如果新情報中有角色的重點行為/變化，請在 turning_points 陣列新增一筆。若沒有變化，則維持原 turning_points。"
+        # 根據類型給予描述建議
+        desc_advice = ""
+        if entity_type == "character":
+            desc_advice = "（人物描述應包含：穿著外觀、性格特徵、行動準則等）"
+        elif entity_type in ["item", "artifact", "magic"]:
+            desc_advice = "（物品描述應包含：外觀材質、用途功能、歷史背景等）"
+        elif entity_type in ["poi", "world-setting"]:
+            desc_advice = "（地點/設定描述應包含：地理外觀、建築風格、文化氛圍等）"
+
+        system_prompt = (
+            f"你是一個小說知識管理員。請為新發現的 {entity_type} 「{keyword}」建立初始條目。\n"
+            f"1. **description 撰寫**：根據情報撰寫豐富的描述。{desc_advice}\n"
+            f"2. **major_status_changes**：若情節中有重大轉折或初始狀態，請新增一條記錄（scene_index: {current_scene_index}）。\n"
+            f"3. **輸出語言要求**：按照文章原文輸出。"
+        )
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
+            {"role": "user", "content": f"【新條目情報】：\n{new_context}\n\n請建立條目："}
         ]
+
         return self._call_with_schema(messages, schema)
 
-    def merge_generic_entity(self, keyword: str, entity_type: str, new_context: str, existing_data: dict) -> Tuple[str, dict]:
+    def merge_entity(self, keyword: str, entity_type: str, new_context: str, candidates: List[dict], current_scene_index: int) -> Tuple[str, dict]:
         """
-        針對 Item, Poi, World-Setting 的通用合併邏輯
+        Step 2 - 分流 B: 條目合併與情報更新 (極簡結構)
         """
         schema = {
             "type": "object",
             "properties": {
-                "keyword": {"type": "string"},
+                "selected_index": {"type": "integer", "description": "0~N 匹配索引，-1 代表皆不匹配 (視為新條目)"},
+                "keyword": {"type": "string", "description": "確定的核心名稱"},
                 "aliases": {"type": "array", "items": {"type": "string"}},
                 "categories": {"type": "array", "items": {"type": "string"}},
                 "type": {"type": "string"},
-                "description": {"type": "string"}
+                "description": {"type": "string"},
+                "major_status_changes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "scene_index": {"type": "integer"},
+                            "event": {"type": "string"}
+                        },
+                        "required": ["scene_index", "event"],
+                        "additionalProperties": False
+                    }
+                }
             },
-            "required": ["keyword", "aliases", "categories", "type", "description"],
+            "required": ["selected_index", "keyword", "aliases", "categories", "type", "description", "major_status_changes"],
             "additionalProperties": False
         }
-        
-        system_prompt = (
-            f"你是一個專案設定管理員。需要將「新獲得的情報」合併進「現存的 {entity_type} 檔案」中。\n"
-            "請盡可能豐富並保留原有資訊，並回傳格式化 JSON。"
-        )
 
-        user_content = f"【現存檔案】：\n{json.dumps(existing_data, ensure_ascii=False) if existing_data else '無，這是新條目。'}\n\n"
-        user_content += f"【新情報】：\n{new_context}\n\n"
-        user_content += "請結合上述兩者，總結成最完整的 description。"
+        candidate_text = ""
+        for i, cand in enumerate(candidates):
+            candidate_text += f"候選人 [{i}]:\n{json.dumps(cand, ensure_ascii=False)}\n\n"
+
+        # 根據類型給予描述建議
+        desc_advice = ""
+        if entity_type == "character":
+            desc_advice = "（人物描述應包含：穿著外觀、性格特徵、行動準則等）"
+        elif entity_type in ["item", "artifact", "magic"]:
+            desc_advice = "（物品描述應包含：外觀材質、用途功能、歷史背景等）"
+        elif entity_type in ["poi", "world-setting"]:
+            desc_advice = "（地點/設定描述應包含：地理外觀、建築風格、文化氛圍等）"
+
+        system_prompt = (
+            f"你是一個小說知識管理員。請判斷新情報是否對應候選名單中的某個 {entity_type}。\n"
+            f"1. **selected_index**：匹配填索引，若皆不匹配（即使 RAG 找出了相似對象，但你判斷不是）則填 -1。\n"
+            f"2. **keyword 鎖定**：如果匹配，除非候選人原名為「未知人物」，否則必須沿用候選人的 keyword。\n"
+            f"3. **description 撰寫**：整合新舊情報，撰寫豐富的描述。{desc_advice}\n"
+            f"4. **major_status_changes**：若新情報中有重大轉折、受傷、升級、損毀等，請新增一條記錄（scene_index: {current_scene_index}）。\n"
+            f"5. **繁體中文要求**：全繁體輸出。"
+        )
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
+            {"role": "user", "content": f"【候選清單】：\n{candidate_text}\n【新情報】：\n{new_context}\n\n請決策："}
         ]
-        return self._call_with_schema(messages, schema)
+
+        def validator(data):
+            idx = data.get("selected_index")
+            if not (-1 <= idx < len(candidates)): return False
+            return True
+
+        return self._call_with_schema(messages, schema, validator=validator)

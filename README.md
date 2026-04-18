@@ -19,33 +19,44 @@
 ### 屬性定義 (Properties)
 | 屬性名稱          | 型別 (DataType)       | 說明與防呆機制 |
 |-------------------|----------------------|----------------|
-| `novel_hash`      | `TEXT`               | 雜湊過的小說編號 (例如 `f9b8afed`)，做為租戶隔離，查詢時必加 Filter。<br/>*配置 `skip_vectorization=True`* |
+| `novel_hash`      | `TEXT`               | 雜湊過的小說編號，做為租戶隔離，查詢時必加 Filter。<br/>*配置 `skip_vectorization=True`* |
 | `vol_num`         | `INT`                | 該屬性屬於哪一集的資訊快照設定。 |
 | `entity_type`     | `TEXT`               | 例如 `character`, `item`, `poi`, `world-setting`。<br/>*使用 `Tokenization.GSE` 中文分詞器* |
-| `keyword`         | `TEXT`               | 最常用的指標性稱呼。<br/>*使用 `Tokenization.GSE` 中文分詞器* |
-| `aliases`         | `TEXT_ARRAY` (陣列)  | **這是解決同音/代稱分裂的核心**。蒐羅所有代稱與方言。<br/>*使用 `Tokenization.GSE` 中文分詞器* |
-| `categories`      | `TEXT_ARRAY` (陣列)  | 條目分類標籤（例如：`["劍", "武器"]`、`["人類", "劍士"]`）。方便大範圍類別檢索。<br/>*使用 `Tokenization.GSE` 中文分詞器* |
-| `appeared_in`     | `INT_ARRAY` (陣列)   | 所有的出場紀錄，精確記錄這個條目曾在哪些分片（Scene ID）中被提及。 |
-| `content`         | `TEXT`               | `KnowledgeAgent` 返回的該條目完整 JSON 字串備份。<br/>*配置 `skip_vectorization=True`* |
+| `keyword`         | `TEXT`               | 核心 Canonical Name。<br/>*使用 `Tokenization.GSE` 中文分詞器* |
+| `aliases`         | `TEXT_ARRAY` (陣列)  | 蒐羅所有代稱與方言。<br/>*使用 `Tokenization.GSE` 中文分詞器* |
+| `description`     | `TEXT`               | 豐富的文本描述（含外觀、性格、功能等關鍵設定）。<br/>*使用 `Tokenization.GSE` 中文分詞器* |
+| `appeared_in`     | `INT_ARRAY` (陣列)   | 實體曾在哪些分片（Scene ID）中被提及。由程式碼維護。 |
+| `content`         | `TEXT`               | 該實體完整的極簡 JSON 字串備份。<br/>*配置 `skip_vectorization=True`* |
 
 > 💡 **中文分詞技術細節**：
 > 包含 `aliases` 在內的所有可搜尋文字皆掛上了 **GSE (Go Segmenter)** 分詞器，解決了 Weaviate 中文長字串被視為單一 Token 的缺陷。
 
 ---
 
-## 3. 多重命名向量與檢索策略 (Named Vectors - BYOV)
+專案採用 **Bring Your Own Vectors (BYOV)** 設計，模型使用 `multilingual-e5-large` 進行精準編碼。Weaviate 內部維護兩組獨立的向量空間：
 
-專案採用 **Bring Your Own Vectors (BYOV)** 設計，模型使用 `multilingual-e5-large` 進行精準編碼（確保已加裝 `passage:` 前綴）。Weaviate 內部維護三組獨立的向量空間：
+1. **`identity` 向量**：利用 `keyword` 與 `aliases` 計算。專門用來找人/物。
+2. **`content` 向量**：利用完整的 `description` 與 `major_status_changes` 計算，專門處理模糊語義提問（如：外觀描述、性格特徵）。
 
-1. **`identity` 向量**：利用 `keyword` 與 `aliases` 計算。專門用來找人。
-2. **`equipment` 向量**：利用人物的 `profile.equipment`（或道具自身的描述）計算。使得未來使用者搜尋「EX咖哩棒」時，能透過給予 `equipment` 向量高權重，精確地叫出它的持有者。
-3. **`context` 向量**：利用完整的個性、外觀與長文描述計算，專門對付「那個綁馬尾藍眼睛的女孩是誰」此類模糊語義提問。
+### 3.3 知識提取與決策分流 (Branching Decision Logic)
+為了提高效率並防止邏輯混亂，系統在處理新條目時會根據 Weaviate 的檢索結果進行分流：
 
-### 新情報合併時的搜索策略：Hybrid Search
-當從新場景抽出一段條目描述時，在新建條目前，系統會使用 Weaviate 的 **Hybrid Search (Alpha = 0.5)** 去撞擊 `context` 向量與 BM25 關鍵字：
-* 如果別名完全命中，BM25 權重發威保證提取到現存檔案。
-* 如果別名寫錯但描述相似，e5 Vector 發威把檔案拉回來。
-* 只有當真的找不到時，才會建立全新條目。
+#### 分流 A：全新條目初始化 (Creation)
+若 Weaviate 檢索不到任何相似的候選人，系統直接進入 **Initialization** 流程：
+- 任務：僅負責將提取到的片段資訊豐富化，撰寫高品質的初始描述與狀態。
+- 優點：LLM 不需要參與複雜的合併判斷，減少 Token 浪費與錯誤機率。
+
+#### 分流 B：現有條目合併與更新 (Merging)
+若檢索到 Top-K 候選人，則進入 **Expert Decision** 流程：
+- 任務：由 LLM 判斷 `selected_index`（0-N 匹配，-1 則即使相似也視為新條目）。
+- 合併原則：如果確定匹配，則執行 **Data Merge**。
+
+#### 系統合併核心機制：
+為了確保資料結構的鋼鐵級穩定，Agent 內建了自動化同步邏輯：
+1. **Canonical Keyword 鎖定**：如果判定為同一實體，系統會優先保留「已存在」的名稱作為 Canonical Name，防止實體命名隨場景偏差（例如：從代號變為真名）。新名稱將自動歸入 `aliases`。
+2. **別名聯集 (Alias Merging)**：自動合併新舊資料中所有的別名。
+3. **重大狀態變更整合 (Status Aggregation)**：自動合併並按場景順序排列 `major_status_changes`。
+4. **場景追蹤 (`appeared_in`)**：由程式碼嚴格維護，記錄實體曾在哪一卷、哪一場景出現過。
 
 ---
 
@@ -76,7 +87,21 @@
 
 ---
 
-## 5. 檢索架構規劃 (RAG Agent 查詢藍圖)
+## 5. 診斷日誌系統 (Diagnostic Logs)
+
+所有合併決策與檢索過程皆會產生透明化的 JSON 日誌，儲存於 `output/<novel_hash>/logs/extraction/`。
+
+### 日誌核心欄位：
+* **`rag_search_params`**：記錄當時搜尋 Weaviate 使用的關鍵字、摘要、卷數、類型與 Top-K 參數。
+* **`candidates_from_rag`**：記錄 Weaviate 實際回傳的所有原始資料 (含 UUID 與 相似度評分)。
+* **`thought`**：記錄 LLM 對於候選人篩選的 Chain-of-Thought 推理邏輯。
+* **`result`**：記錄最終產出的合併資料結構與 `selected_index`。
+
+透過此日誌，開發者可以輕鬆判斷「合併失效」是因為 Weaviate 沒搜到資料，還是 LLM 腦補了錯誤的匹配。
+
+---
+
+## 6. 檢索架構規劃 (RAG Agent 查詢藍圖)
 
 為了避免未來實作問答 Agent（例如 LangChain Tool Calling）時造成 System Prompt 臃腫與模型選擇障礙，本專案捨棄硬寫數十種特化查表的函式，改採 **「單一高抽象萬用查詢接口 (Universal Self-Querying Tool)」** 策略。
 
@@ -108,7 +133,7 @@
 
 ---
 
-## 6. 後處理與 Context 排序策略 (RAG Post-Retrieval)
+## 7. 候處理與 Context 排序策略 (RAG Post-Retrieval)
 
 ### 1. 嚴格時序排列 (Chronological/Causal Sorting)
 在組裝 RAG Prompt 時，**嚴格棄用任何破壞時序的重排演算法** (如 LongContextReorder)。

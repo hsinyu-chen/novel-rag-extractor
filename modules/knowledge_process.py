@@ -84,18 +84,78 @@ class KnowledgeProcess:
             if progress and tasks_ui:
                 progress.update(tasks_ui["merge_task"], description=f"[yellow]Merging Entity: {keyword} ({e_type})...")
 
-            # 從 Weaviate 進行語義搜索，拿回最符合的 UUID 與 JSON 結構 (限制搜索上限為目前的 vol_num)
-            existing_data = self.weaviate_db.search_similar_entity(novel_hash, vol_num, e_type, keyword, context)
-            existing_uuid = existing_data.pop("_weaviate_uuid", None) if existing_data else None
+            # [Top-K RAG] 從 Weaviate 檢索受限於相同小說與卷數的候選人
+            candidates = self.weaviate_db.search_similar_entity(
+                novel_hash, vol_num, e_type, keyword, context, top_k=5
+            )
 
-            if e_type == "character":
-                _, merged_data = self.agent.merge_character(keyword, context, existing_data, scene_idx)
+            if not candidates:
+                # [全然新建]：完全沒找到候選人，直接初始化條目
+                thought, merged_result = self.agent.create_initial_entity(keyword, e_type, context, scene_idx)
             else:
-                _, merged_data = self.agent.merge_generic_entity(keyword, e_type, context, existing_data)
+                # [合併決策]：進入 LLM 判斷與整合流程
+                llm_candidates = []
+                cand_uuids = []
+                for cand in candidates:
+                    cand_copy = dict(cand)
+                    cand_uuids.append(cand_copy.pop("_weaviate_uuid", None))
+                    cand_copy.pop("_score", None)
+                    cand_copy.pop("appeared_in", None)
+                    llm_candidates.append(cand_copy)
 
-            if merged_data:
-                merged_entities.append({
+                thought, merged_result = self.agent.merge_entity(keyword, e_type, context, llm_candidates, scene_idx)
+
+            if merged_result:
+                selected_idx = merged_result.get("selected_index", -1)
+                existing_uuid = None
+                merged_data = dict(merged_result)
+                
+                # 1. 核心繼承邏輯
+                if selected_idx >= 0 and selected_idx < len(cand_uuids):
+                    existing_uuid = cand_uuids[selected_idx]
+                    old_obj = candidates[selected_idx]
+                    
+                    # [場景繼承]
+                    merged_data["appeared_in"] = old_obj.get("appeared_in", [])
+
+                    # [名稱權限與別名優先級]
+                    # 如果舊名稱不是「未知」，則強制鎖定舊名稱為 Canonical Name
+                    old_keyword = old_obj.get("keyword", "")
+                    if "未知" not in old_keyword and old_keyword != keyword:
+                        merged_data["keyword"] = old_keyword
+                        # 將新提取的名稱存入別名
+                        if keyword not in merged_data["aliases"]:
+                            merged_data["aliases"].append(keyword)
+
+                    # [別名整合]：聯集舊實體的別名
+                    existing_aliases = old_obj.get("aliases", [])
+                    merged_data["aliases"] = list(set((merged_data.get("aliases") or []) + existing_aliases))
+
+                    # [狀態變更整合]：聯集舊實體的狀態記錄
+                    existing_status = old_obj.get("major_status_changes", [])
+                    new_status = merged_data.get("major_status_changes", [])
+                    # 以 scene_index + event 作為唯一性判斷 (簡單過濾)
+                    combined_status = existing_status + [ns for ns in new_status if ns not in existing_status]
+                    merged_data["major_status_changes"] = sorted(combined_status, key=lambda x: x.get("scene_index", 0))
+
+                # 2. 清理與標準化
+                merged_data.pop("selected_index", None)
+                merged_data["type"] = e_type 
+
+                # 3. 寫入偵錯 Log
+                log_filename = f"scene_{scene_idx:03d}_merge_{keyword}_{hashlib.md5(str(existing_uuid or '').encode()).hexdigest()[:8]}.json"
+                self._save_log(novel_hash, log_filename, {
+                    "scene_index": scene_idx,
                     "keyword": keyword,
+                    "type": e_type,
+                    "candidates_count": len(candidates),
+                    "thought": thought,
+                    "result": merged_data,
+                    "existing_uuid": existing_uuid
+                })
+
+                merged_entities.append({
+                    "keyword": merged_data["keyword"], # 使用最終確定的 Keyword
                     "merged_data": merged_data,
                     "existing_uuid": existing_uuid
                 })
@@ -156,6 +216,21 @@ class KnowledgeProcess:
             progress.update(tasks_ui["save_task"], completed=100)
 
         return data
+
+    def _save_log(self, novel_hash: str, filename: str, log_data: Any):
+        """
+        儲存萃取與合併過程的偵錯 Log
+        路徑: output/<hash>/logs/extraction/<filename>.json
+        """
+        log_dir = os.path.join("output", novel_hash, "logs", "extraction")
+        os.makedirs(log_dir, exist_ok=True)
+        
+        log_path = os.path.join(log_dir, filename)
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                json.dump(log_data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"[KnowledgeProcess] Failed to save log {filename}: {e}")
 
     def run(self, novel_name: str, start_vol: int, end_vol: int = 0, clean_output: bool = False):
         base_data_path = os.path.join("data", novel_name)
