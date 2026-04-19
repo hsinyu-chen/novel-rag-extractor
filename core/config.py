@@ -72,7 +72,7 @@ class ConfigService:
             # QA Agent FSM (llama-server 預設 8K ctx；調大的話同步改這裡)
             qa_max_ctx_tokens=int(os.getenv("QA_MAX_CTX_TOKENS", 65536)),
             qa_ctx_gate=float(os.getenv("QA_CTX_GATE", 0.7)),
-            qa_max_iter=int(os.getenv("QA_MAX_ITER", 8)),
+            qa_max_iter=int(os.getenv("QA_MAX_ITER", 20)),
             qa_temp=float(os.getenv("QA_TEMP", 1.0)),
             qa_top_p=float(os.getenv("QA_TOP_P", 0.95)),
             qa_top_k=int(os.getenv("QA_TOP_K", 64)),

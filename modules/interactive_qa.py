@@ -50,53 +50,50 @@ class InteractiveQA:
                     continue
         return max_vol or 1
 
-    def _build_system_prompt(self, novel_name: str, novel_hash: str, max_vol: int) -> str:
-        """從 Weaviate 拉本書統計 + 全 DB 收錄狀況，拼進 system prompt。"""
+    def _build_system_prompt(self, preferred_novel: str = "", preferred_hash: str = "") -> str:
+        """列出全庫所有小說讓 agent 自由挑選 novel_hash。"""
         db_novels = []
         try:
             db_novels = self.weaviate_db.list_novels()
         except Exception as e:
             print(f"[InteractiveQA] list_novels failed: {e}")
 
-        profile = {}
-        try:
-            profile = self.weaviate_db.get_novel_profile(novel_hash)
-        except Exception as e:
-            print(f"[InteractiveQA] get_novel_profile failed: {e}")
-
-        # --- 全庫概況 ---
-        db_lines = [f"【資料庫收錄】共 {len(db_novels)} 部小說："]
+        db_lines = [f"【資料庫收錄】共 {len(db_novels)} 部小說（呼叫工具時可用 novel_hash 鎖定，留空即跨 DB）："]
         for n in db_novels:
             h = n.get("novel_hash", "")
             vols = n.get("vols") or []
             vol_nums = [v["vol_num"] for v in vols]
-            marker = "  ← 目前會話" if h == novel_hash else ""
+            marker = "  ← 使用者此次主要關心" if preferred_hash and h == preferred_hash else ""
             db_lines.append(
                 f"  - hash={h} | vols={vol_nums or '(無)'} | "
                 f"scenes={n.get('chunk_count', 0)} | entities={n.get('entity_count', 0)}{marker}"
             )
 
-        # --- 本書詳細 ---
-        vols = profile.get("vols") or []
-        vol_detail = "、".join([f"vol{v['vol_num']}({v['scene_count']}scenes)" for v in vols]) or "(無)"
-        type_map = profile.get("entity_by_type") or {}
-        type_str = "、".join([f"{k}:{v}" for k, v in type_map.items()]) or "(無)"
-        top = profile.get("top_entities") or []
-        top_str = "、".join([f"{e['keyword']}({e['type']},{e['appearances']}場)" for e in top]) or "(無)"
+        if preferred_hash:
+            profile = {}
+            try:
+                profile = self.weaviate_db.get_novel_profile(preferred_hash)
+            except Exception as e:
+                print(f"[InteractiveQA] get_novel_profile failed: {e}")
+            vols = profile.get("vols") or []
+            vol_detail = "、".join([f"vol{v['vol_num']}({v['scene_count']}scenes)" for v in vols]) or "(無)"
+            type_map = profile.get("entity_by_type") or {}
+            type_str = "、".join([f"{k}:{v}" for k, v in type_map.items()]) or "(無)"
+            top = profile.get("top_entities") or []
+            top_str = "、".join([f"{e['keyword']}({e['type']},{e['appearances']}場)" for e in top]) or "(無)"
+            db_lines += [
+                f"\n【使用者偏好作品】{preferred_novel}  (hash={preferred_hash})",
+                f"  卷分佈：{vol_detail}",
+                f"  條目總數：{profile.get('entity_count', 0)}  → {type_str}",
+                f"  高出場條目：{top_str}",
+                "  （偏好作品只是優先順序提示；agent 仍可依問題需要做跨 DB 檢索。）",
+            ]
 
-        cur_lines = [
-            f"\n【目前會話小說】{novel_name}  (hash={novel_hash})",
-            f"  卷分佈：{vol_detail}",
-            f"  可查詢上限卷數：{max_vol}（vol_num > {max_vol} 的資料會被過濾）",
-            f"  條目總數：{profile.get('entity_count', 0)}  → {type_str}",
-            f"  高出場條目：{top_str}",
-        ]
-
-        context_block = "\n".join(db_lines + cur_lines)
+        context_block = "\n".join(db_lines)
         return context_block + "\n\n" + DEFAULT_SYSTEM
 
-    def _build_agent(self, novel_hash: str, max_vol: int) -> QueryAgent:
-        tools = build_query_tools(self.weaviate_db, novel_hash=novel_hash, max_vol=max_vol)
+    def _build_agent(self) -> QueryAgent:
+        tools = build_query_tools(self.weaviate_db)
         # 用 SUMMARY_* 這組 config 當作 QA LLM 入口（同一台 llama-server）
         return QueryAgent(
             base_url=self.conf.get("summary_base_url"),
@@ -106,7 +103,7 @@ class InteractiveQA:
             tokenize_fn=self.embed_engine.tokenize,
             max_ctx_tokens=int(self.conf.get("qa_max_ctx_tokens", 8192)),
             ctx_gate=float(self.conf.get("qa_ctx_gate", 0.7)),
-            max_iter=int(self.conf.get("qa_max_iter", 8)),
+            max_iter=int(self.conf.get("qa_max_iter", 20)),
             temperature=float(self.conf.get("qa_temp", 1.0)),
             top_p=float(self.conf.get("qa_top_p", 0.95)),
             top_k=int(self.conf.get("qa_top_k", 64)),
@@ -213,24 +210,26 @@ class InteractiveQA:
     # ---------- 對外入口 ----------
     def run(
         self,
-        novel_name: str,
+        novel_name: str = "",
         prompt: str = "",
         vol: int = 0,
         show_graph: bool = False,
         debug: bool = False,
     ):
-        base_data_path = os.path.join("data", novel_name)
-        novel_hash = self._get_path_hash(base_data_path)
-        max_vol = self._detect_max_vol(novel_hash, override=vol)
+        preferred_hash = ""
+        if novel_name:
+            preferred_hash = self._get_path_hash(os.path.join("data", novel_name))
 
         self.console.print(
             f"[bold magenta]>> QA Agent[/bold magenta]  "
-            f"novel=[cyan]{novel_name}[/cyan]  hash=[cyan]{novel_hash}[/cyan]  "
-            f"max_vol=[cyan]{max_vol}[/cyan]"
+            f"scope=[cyan]{'全庫跨 DB' if not preferred_hash else f'偏好 {novel_name} (hash={preferred_hash})'}[/cyan]"
         )
 
-        agent = self._build_agent(novel_hash, max_vol)
-        system_prompt = self._build_system_prompt(novel_name, novel_hash, max_vol)
+        agent = self._build_agent()
+        system_prompt = self._build_system_prompt(
+            preferred_novel=novel_name,
+            preferred_hash=preferred_hash,
+        )
 
         if show_graph:
             self.console.print("[dim]--- Graph (mermaid) ---[/dim]")

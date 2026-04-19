@@ -450,9 +450,11 @@ class WeaviateStorage:
         """
         collection = self._client.collections.get("NovelEntity")
 
-        flt = Filter.by_property("novel_hash").equal(novel_hash) & \
-              Filter.by_property("vol_num").less_or_equal(max_vol) & \
-              Filter.by_property("tainted").not_equal(True)
+        flt = Filter.by_property("tainted").not_equal(True)
+        if novel_hash:
+            flt = flt & Filter.by_property("novel_hash").equal(novel_hash)
+        if max_vol and max_vol > 0:
+            flt = flt & Filter.by_property("vol_num").less_or_equal(max_vol)
         if filter_type:
             flt = flt & Filter.by_property("entity_type").equal(filter_type)
         if filter_categories:
@@ -515,9 +517,12 @@ class WeaviateStorage:
         """
         collection = self._client.collections.get("NovelChunk")
 
-        flt = Filter.by_property("novel_hash").equal(novel_hash)
+        flt: Optional[Any] = None
+        if novel_hash:
+            flt = Filter.by_property("novel_hash").equal(novel_hash)
         if vol_num and vol_num > 0:
-            flt = flt & Filter.by_property("vol_num").equal(vol_num)
+            vol_flt = Filter.by_property("vol_num").equal(vol_num)
+            flt = vol_flt if flt is None else flt & vol_flt
 
         results: List[Dict[str, Any]] = []
         query_text = (query_text or "").strip()
@@ -528,12 +533,13 @@ class WeaviateStorage:
                 tmp = []
                 for obj in resp.objects:
                     tmp.append({
+                        "novel_hash": obj.properties.get("novel_hash", ""),
                         "vol_num": obj.properties.get("vol_num"),
                         "scene_index": obj.properties.get("scene_index"),
                         "title": obj.properties.get("title", ""),
                         "token_count": obj.properties.get("token_count", 0),
                     })
-                tmp.sort(key=lambda x: (x.get("vol_num") or 0, x.get("scene_index") or 0))
+                tmp.sort(key=lambda x: (x.get("novel_hash") or "", x.get("vol_num") or 0, x.get("scene_index") or 0))
                 results = tmp[:limit]
             except Exception as e:
                 print(f"[Weaviate] search_scenes list-mode failed: {e}")
@@ -551,6 +557,7 @@ class WeaviateStorage:
                 )
                 for obj in resp.objects:
                     results.append({
+                        "novel_hash": obj.properties.get("novel_hash", ""),
                         "vol_num": obj.properties.get("vol_num"),
                         "scene_index": obj.properties.get("scene_index"),
                         "title": obj.properties.get("title", ""),
@@ -701,6 +708,7 @@ class WeaviateStorage:
             data = {}
         return {
             "uuid": str(obj.uuid),
+            "novel_hash": obj.properties.get("novel_hash", ""),
             "keyword": data.get("keyword") or obj.properties.get("keyword", ""),
             "type": data.get("type") or obj.properties.get("entity_type", ""),
             "aliases": data.get("aliases") or obj.properties.get("aliases", []),

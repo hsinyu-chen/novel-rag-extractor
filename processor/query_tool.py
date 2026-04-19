@@ -14,6 +14,13 @@ class SearchWorldKnowledgeArgs(BaseModel):
             "若只想用分類過濾或列舉全部，請留空字串。"
         ),
     )
+    novel_hash: str = Field(
+        default="",
+        description=(
+            "可選：限定某部小說的 hash（見 system prompt 列出的 hash 值）。"
+            "留空字串 → 跨所有小說檢索。"
+        ),
+    )
     filter_type: str = Field(
         default="",
         description="可選：限定條目類別，只能填 character / location / object / concept / 空字串",
@@ -32,7 +39,11 @@ class SearchWorldKnowledgeArgs(BaseModel):
 class SearchScenesArgs(BaseModel):
     query_text: str = Field(
         default="",
-        description="場景語意檢索，例如：'男主第一次遇到聖劍'。留空則列舉指定卷的所有 scene。",
+        description="場景語意檢索，例如：'男主第一次遇到聖劍'。留空則列舉指定範圍的所有 scene。",
+    )
+    novel_hash: str = Field(
+        default="",
+        description="可選：限定某部小說；留空 → 跨所有小說檢索。",
     )
     vol_num: int = Field(
         default=0,
@@ -41,22 +52,23 @@ class SearchScenesArgs(BaseModel):
     limit: int = Field(default=5, description="回傳筆數上限")
 
 
-def build_query_tools(weaviate_db: WeaviateStorage, novel_hash: str, max_vol: int) -> list:
+def build_query_tools(weaviate_db: WeaviateStorage) -> list:
     """
-    將 WeaviateStorage 包裝成兩個 LangChain tool，綁定 novel_hash 與 max_vol 於 closure，
-    LLM 看不到也無法亂填這兩個參數。
+    將 WeaviateStorage 包裝成兩個 LangChain tool。
+    不再綁定特定 novel_hash；LLM 可透過參數選擇目標小說（留空 = 跨 DB）。
     """
 
     def _search_world_knowledge(
         query_text: str = "",
+        novel_hash: str = "",
         filter_type: str = "",
         filter_categories: Optional[List[str]] = None,
         sort_by: str = "relevance",
         limit: int = 5,
     ) -> str:
         results = weaviate_db.universal_search(
-            novel_hash=novel_hash,
-            max_vol=max_vol,
+            novel_hash=novel_hash or "",
+            max_vol=0,
             query_text=query_text,
             filter_type=filter_type,
             filter_categories=filter_categories or [],
@@ -70,6 +82,7 @@ def build_query_tools(weaviate_db: WeaviateStorage, novel_hash: str, max_vol: in
             slim.append({
                 "keyword": r.get("keyword"),
                 "type": r.get("type"),
+                "novel_hash": r.get("novel_hash"),
                 "aliases": r.get("aliases") or [],
                 "categories": r.get("categories") or [],
                 "description": (r.get("description") or "")[:500],
@@ -78,9 +91,14 @@ def build_query_tools(weaviate_db: WeaviateStorage, novel_hash: str, max_vol: in
             })
         return json.dumps({"hits": len(slim), "items": slim}, ensure_ascii=False)
 
-    def _search_scenes(query_text: str = "", vol_num: int = 0, limit: int = 5) -> str:
+    def _search_scenes(
+        query_text: str = "",
+        novel_hash: str = "",
+        vol_num: int = 0,
+        limit: int = 5,
+    ) -> str:
         results = weaviate_db.search_scenes(
-            novel_hash=novel_hash,
+            novel_hash=novel_hash or "",
             query_text=query_text,
             vol_num=vol_num,
             limit=max(1, min(limit, 15)),
@@ -91,8 +109,8 @@ def build_query_tools(weaviate_db: WeaviateStorage, novel_hash: str, max_vol: in
         func=_search_world_knowledge,
         name="search_world_knowledge",
         description=(
-            "查詢小說世界觀知識庫（人物、地點、物品、概念）。"
-            "用來查具名條目、羅列某類條目、找主角或重要設定。"
+            "查詢小說世界觀知識庫（人物、地點、物品、概念），可跨多部小說檢索。"
+            "novel_hash 留空 → 跨 DB；帶 hash → 鎖定單一作品。"
             "query_text 留空 + filter_categories 或 sort_by=appearances 可做精準列舉。"
         ),
         args_schema=SearchWorldKnowledgeArgs,
@@ -101,9 +119,8 @@ def build_query_tools(weaviate_db: WeaviateStorage, novel_hash: str, max_vol: in
         func=_search_scenes,
         name="search_scenes",
         description=(
-            "查詢場景分片的劇情摘要（Layer 1 chunks）。"
-            "問整卷劇情走向、某個事件發生在哪裡、找特定場景時用這個。"
-            "vol_num=N 限定某卷，=0 跨卷；query_text 留空則列舉該卷的 scene 大綱。"
+            "查詢場景分片的劇情摘要（Layer 1 chunks），可跨多部小說。"
+            "novel_hash 留空 → 跨 DB；vol_num=0 → 跨卷；query_text 留空則列舉範圍內的 scene 大綱。"
         ),
         args_schema=SearchScenesArgs,
     )

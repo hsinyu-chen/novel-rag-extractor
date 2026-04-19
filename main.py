@@ -17,7 +17,7 @@ def main():
         
     # 1. 解析命令列參數
     parser = argparse.ArgumentParser(description="Narrative RAG Pipeline Entry Point")
-    parser.add_argument("--novel", type=str, required=True, help="小說資料夾名稱")
+    parser.add_argument("--novel", type=str, default="", help="小說資料夾名稱（ingest/process 模式必填；qa 模式選填作為偏好作品提示）")
     parser.add_argument("--start", type=int, default=1, help="起始集數數字")
     parser.add_argument("--vol", type=int, default=0, help="只跑指定的單一集數")
     parser.add_argument("--clean", action="store_true", help="清除該小說的全部輸出後重跑")
@@ -37,6 +37,9 @@ def main():
     container.config.from_dict(asdict(config))
     
     # 4. 根據模式執行業務 (Resolve and Run)
+    if args.mode in ["ingest", "process", "all"] and not args.novel:
+        parser.error(f"--novel is required for --mode {args.mode}")
+
     if args.mode in ["ingest", "all"]:
         print(f"\n[Mode: Ingest] Starting pre-processing for {args.novel}...")
         # 從容器中解析出 pre_processor，所有依賴會自動注入
@@ -53,7 +56,8 @@ def main():
         knowledge_processor.run(args.novel, start, end_vol=end, clean_output=args.clean)
 
     if args.mode == "qa":
-        print(f"\n[Mode: QA] Starting interactive query agent for {args.novel}...")
+        scope = args.novel if args.novel else "all novels"
+        print(f"\n[Mode: QA] Starting interactive query agent (scope: {scope})...")
         qa_runner = container.qa_runner()
         qa_runner.run(
             novel_name=args.novel,
