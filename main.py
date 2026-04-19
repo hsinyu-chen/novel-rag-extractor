@@ -56,7 +56,7 @@ def main():
         knowledge_processor.run(args.novel, start, end_vol=end, clean_output=args.clean)
 
     if args.mode in ["summary", "all"]:
-        print(f"\n[Mode: Summary] Starting 2-pass volume summary reducer for {args.novel}...")
+        print(f"\n[Mode: Summary] Starting 2-pass + 3-pass volume summary reducer for {args.novel}...")
         summary_processor = container.summary_processor()
         start = args.vol if args.vol else args.start
         end = args.vol if args.vol else 0

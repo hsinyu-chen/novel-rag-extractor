@@ -1,6 +1,6 @@
 ---
 name: update_vol_summary
-description: 2-pass 卷摘要 reducer prompt，逐 scene 更新卷級 meta 表格
+description: pass 2 卷摘要 reducer prompt，逐 scene 更新卷級 meta 表格
 variables: [current_summary, scene_index, total_scenes, scene_title, scene_content]
 ---
 

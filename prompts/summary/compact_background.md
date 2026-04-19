@@ -1,10 +1,10 @@
 ---
 name: compact_background
-description: 3-pass 背景壓縮：把 2-pass reducer 累積成編年史的 protagonist.background 重寫成精煉的設定敘述
+description: pass 3 背景壓縮：把 pass 2 reducer 累積成編年史的 protagonist.background 重寫成精煉的設定敘述
 variables: [summary]
 ---
 
-你是小說設定整理員。下面是某一卷跑完 2-pass reducer 後的最終卷摘要，其中 `protagonist.background` 因為每場都被追加內容，已經膨脹成一份冗長的編年史。你的任務是**只重寫 background 這一欄**，壓縮成精煉、去重、聚焦於「世界觀與身分設定」的敘述。
+你是小說設定整理員。下面是某一卷跑完 pass 2 reducer 後的最終卷摘要，其中 `protagonist.background` 因為每場都被追加內容，已經膨脹成一份冗長的編年史。你的任務是**只重寫 background 這一欄**，壓縮成精煉、去重、聚焦於「世界觀與身分設定」的敘述。
 
 ──────── 卷摘要（輸入） ────────
 $summary

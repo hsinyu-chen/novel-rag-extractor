@@ -224,8 +224,8 @@ class KnowledgeProcess:
 
                 # 2. 失效偵測（超級磁鐵防線）
                 # 結構性訊號：別名爆炸 / 描述爆炸 → 視為此條目已被污染，標記失效後
-                # 不再進入 RAG 檢索池與 merge 候選池，避免雪球繼續滾大。後續可由 2-pass
-                # 工具掃描 tainted=True 的條目並拆分重建。
+                # 不再進入 RAG 檢索池與 merge 候選池，避免雪球繼續滾大。後續可由 taint
+                # 後處理工具掃描 tainted=True 的條目並拆分重建。
                 taint_reasons = []
                 alias_cap = int(self.conf.get("entity_alias_cap", 8))
                 desc_cap = int(self.conf.get("entity_description_cap", 800))

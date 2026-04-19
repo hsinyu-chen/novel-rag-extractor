@@ -56,7 +56,7 @@ class InteractiveQA:
         return max_vol or 1
 
     def _list_summary_vols(self, novel_hash: str, vol_nums: list) -> list:
-        """掃 output/{hash}/summary/vol_N.json，列出已生成 2-pass 摘要的卷。"""
+        """掃 output/{hash}/summary/vol_N.json，列出已生成卷摘要（pass 2/3）的卷。"""
         done = []
         for v in vol_nums:
             if self.storage.get(f"{novel_hash}.summary.vol_{v}"):

@@ -290,7 +290,7 @@ uv sync
 |  | `ENTITY_DESCRIPTION_CAP` | `800` | description 字數上限，超過即標記 tainted |
 |  | `ENTITY_SEMANTIC_GATE` | `0.75` | merge 時新舊 keyword 的 e5 cosine 低於此值即標記 tainted |
 | QA Agent | `QA_MAX_CTX_TOKENS` | `65536` | LLM context 上限 (對齊 llama-server 啟動值) |
-|  | `QA_CTX_GATE` | `0.7` | 超過此比例觸發 Map-Reduce 篩選 |
+|  | `QA_CTX_GATE` | `0.7` | token_ratio 超過此值即強制切到 answer 節點（防 ctx 爆量） |
 |  | `QA_MAX_ITER` | `20` | Tool calling 最大迭代次數 |
 |  | `QA_TEMP` / `QA_TOP_P` / `QA_TOP_K` | `1.0` / `0.95` / `64` | QA 階段取樣參數 |
 

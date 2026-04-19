@@ -250,7 +250,7 @@ def build_query_tools(weaviate_db: WeaviateStorage, storage: Optional[JsonStorag
             func=_get_vol_summary,
             name="get_vol_summary",
             description=(
-                "取某部小說某卷的 2-pass 卷摘要（主題 / 主角 / 主要角色 / 地點 / 大綱 / 主線 / 未解伏筆）。"
+                "取某部小說某卷的卷摘要（pass 2/3 reducer 產生：主題 / 主角 / 主要角色 / 地點 / 大綱 / 主線 / 未解伏筆）。"
                 "適合 meta 類問題：『這本書在講什麼』『主角是誰』『主要角色』『劇情大綱』等 —— "
                 "比 find_entity_scenes 更快、更聚焦。找不到會回 found=false，此時改走 search_* 組合。"
                 "回傳 YAML 格式。"

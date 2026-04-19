@@ -108,7 +108,7 @@ class SummaryProcess:
             return
 
         novel_hash = self.get_path_hash(base_data_path)
-        self.console.print(f"\n[bold magenta]>> 開始卷摘要 2-pass: {novel_name}[/bold magenta] (Hash: {novel_hash})")
+        self.console.print(f"\n[bold magenta]>> 開始卷摘要 (pass 2 + pass 3): {novel_name}[/bold magenta] (Hash: {novel_hash})")
 
         # 找出所有 vol（透過 Weaviate 的分卷 aggregate）
         profile = self.weaviate_db.get_novel_profile(novel_hash)

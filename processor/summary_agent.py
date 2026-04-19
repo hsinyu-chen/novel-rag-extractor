@@ -85,7 +85,10 @@ def blank_summary() -> Dict[str, Any]:
 
 
 class SummaryAgent:
-    """2-pass 卷摘要 reducer：current_summary + scene → updated_summary。"""
+    """卷摘要 reducer：
+    - update_summary：pass 2（current_summary + scene → updated_summary）
+    - compact_background：pass 3（壓縮 protagonist.background 一欄）
+    """
 
     def __init__(self, engine: NativeLlamaEngine):
         self.engine = engine
