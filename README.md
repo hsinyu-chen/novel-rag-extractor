@@ -1,8 +1,34 @@
-# Narrative RAG Pipeline - VectorDB 架構設計
+# Novel RAG Pipeline — 中文小說 RAG 預處理系統
 
-本專案利用 **Weaviate (v4)** 向量資料庫與 **Gemma 4** 語言模型，打造具備「條目去重」、「分卷快照功能」以及「多重命名向量」的小說 RAG Agent 系統。
+**面向長篇小說的 production-shaped RAG 系統**，解決傳統單層 chunk-only 架構在「跨段落 entity 關聯」、「代名詞/別名解析」、「隱藏伏筆召回」上的結構性弱點。
 
-硬體目標為8GB VRAM的設備
+硬體目標 **8GB VRAM 本地端部署**（Gemma-4 E4B Q4_K_M + multilingual-e5-large f16 同機運行）。
+
+## Tech Stack
+
+| 類別 | 選型 |
+|------|------|
+| 向量資料庫 | **Weaviate v4**（BYOV 多重命名向量 / GSE 中文分詞 / Hybrid Search） |
+| LLM 框架 | **LangChain LCEL**（5 階段 pipeline） + **LangGraph**（FSM QA Agent） |
+| Embedding | **multilingual-e5-large**（BYOV，雙向量分離） |
+| 推論後端 | OpenAI 相容 API（llama.cpp / Ollama / 任意 OAI 相容服務） |
+| 架構治理 | **dependency-injector**（嚴格 DI Container） |
+
+## 核心架構決策
+
+**1. 雙層向量 + 雙向鏈結** —— `NovelChunk`（原文分片，ground truth）與 `NovelEntity`（抽取條目）透過 `chunk_refs ⇄ entity_refs` 雙向鏈結。條目層合併失敗從「災難」降級為「索引不漂亮」，原文檢索不受影響。
+
+**2. BYOV 雙向量：identity / content 分離** —— 每個條目持有兩組命名向量，`identity`（名字）走純 `near_vector`、`content`（描述）走 hybrid。解決短字串 embedding 的「磁鐵效應」（例：`系統` 會把所有科技用語吸進來）。
+
+**3. 雙軌去重 + 程式端閘門** —— Track A（identity）+ Track B（content hybrid）雙軌檢索後，以「字面共字 + 真餘弦相似度」做程式端過濾，明確不合格的候選根本不進 LLM，避免 hybrid score 在小資料庫下的望文生義誤判。
+
+**4. Taint Detection：零關鍵字依賴** —— 用三組**純結構性訊號**（alias 爆炸 / 描述爆炸 / 語意跳躍合併）自動標記「超級磁鐵」條目並退出檢索池，阻止雪球效應。跨題材/跨語言通用。
+
+**5. LangGraph FSM QA Agent + Notes Buffer** —— `plan → tool → take_notes → answer` 狀態機，`take_notes` 節點把 tool 輸出壓縮為精煉 notes，避免原始 JSON 重複塞入 prompt；Token Gate 強制保護 context 上限。
+
+**6. LCEL 5 階段知識抽取 pipeline** —— `write_chunk → extract → merge → backfill → save`，per-entity inline upsert 確保同 scene 後續別名（例：「迪朗達爾 / 聖劍 / 王者之劍」）能正確合併而非各自新建。
+
+**7. 2-pass 卷摘要 reducer** —— 承接 entity 層難以覆蓋的宏觀語境（主題 / 主線 / 未解伏筆），QA agent 面對「這本書在講什麼」類問題先走快查通道，走不到才退回雙層檢索。
 
 ---
 
@@ -192,13 +218,11 @@ agent 正在整理回答...
 - **跨書系全庫問答**：`scope=全庫跨 DB` 表示主角雖不知道「爆肝」指的是哪一本書，系統仍能透過 `novel_hash` 過濾自動鎖定該作品 (《爆肝工程師的異世界狂想曲》) 並回溯對應條目。
 - **條目層 + Scene 層雙軌召回**：稱號、介面、戰鬥能力分別散落於不同 Entity 與原文分片中，靠 Layer 1/Layer 2 的雙向鏈結 (`chunk_refs` ⇄ `entity_refs`) 才能拼出完整能力輪廓。
 
-> 系統還在調教中，目前查詢效果還可以再優化。
-
 ---
 
 ## 配置與使用說明
 
-> **本專案尚未完全完成，部分功能（特別是條目合併與 QA Agent 多輪推理）在邊緣題材下可能出現不穩定行為，請以實驗性工具視之。**
+> **定位為研究/原型階段系統**：條目合併在邊緣題材（大量同名角色、跨語言別名混用）與 QA Agent 長鏈推理仍在調校中，建議先以小規模樣本驗證設計再擴展到長篇/跨書系資料。
 
 ### 前置需求
 
@@ -319,7 +343,7 @@ Named Vectors (BYOV)：
 - **`full_text`**：`content` 的向量，支援「語意搜尋原文片段」
 - **`summary`**：`title` 的向量，支援「根據劇情摘要找 scene」
 
-> ⚠️ **Embed 模型限制**：`multilingual-e5-large` 有 512-token 上限，scene 中位數 ~1844 tokens，full_text 向量只覆蓋前 512 tokens。摘要向量（`summary`）用來回補尾段召回。
+> 💡 **為什麼同時存 full_text + summary 雙向量？** 原文與摘要承接**不同粒度的語義**：前者適合關鍵字級精準檢索（對話、專有名詞、戰鬥細節），後者適合劇情級語意檢索（場景主旨、情感基調）。雙向量並存讓精度與召回可以分別調參，同時對超長 scene 提供跨 embedding window 的語意互補覆蓋。
 
 ### 2.2 Layer 2 — `NovelEntity` (條目)
 
@@ -509,13 +533,11 @@ save_scene_json       → 寫 `world/<type>/<uuid>.json` 與 augment `scene_XXX.
 ### 2. 棄用傳統 Reranker (防範語意破壞)
 絕大部份市面上的輕量級 Rerank 模型（如 `bge-reranker`）皆基於百科全書或標準問答集訓練，其設計邏輯偏向事實檢索。對於小說中極端複雜的「隱喻」、「伏筆」、「人物心境」與「文學性描述」理解能力極差。
 若強悍介入這類泛用型 Reranker 進行二次打分，極容易發生**「干擾大於效果」**的慘況——把沒有直接命中關鍵字、但實際上是核心伏筆的情境分片當成雜訊剃除。
-因此，只要檢索回的 Context 總量座落在 64K Token 的防守範圍內，本系統將完全信任 Weaviate Hybrid Search (`e5` 語意 + `BM25` 精準) 的初篩結果，一律無碼直通給 Gemma-4 處理，保證最深層的文學解讀不被破壞。
+因此，只要檢索回的 Context 總量座落在 64K Token 的防守範圍內，本系統優先讓 Weaviate Hybrid Search (`e5` 語意 + `BM25` 精準) 的初篩結果直通 Gemma-4 處理，避免通用型 reranker 對文學性描述的語義破壞——這是**針對小說題材刻意做的選擇**，通用事實檢索場景仍會接上 reranker。
 
 ### 3. 超量 Context 應對：FSM Agent + Notes 摘要緩衝 (目前實作)
 目前 QA Agent (`processor/query_agent.py`) 以 **LangGraph FSM** 串接 `plan → tool → take_notes → plan → ... → answer` 流程，透過下列兩個機制延緩 Context 爆量：
 * **Token Gate 強制切換**：每一輪 `plan` 結束後以 `tokenize_fn` 估算 `token_ratio`，一旦超過 `qa_ctx_gate`（預設 0.7）或 `iteration` 超過 `qa_max_iter`，立即中止檢索並直接進入 `answer` 節點輸出最終答案，避免 LLM 被超長 Context 塞爆。
 * **Take-Notes 緩衝**：每次工具回傳後由 `_take_notes_node` 將 `ToolMessage` 內容擷取為 `notes` 欄位，作為下一輪 plan 的精煉參考，避免原始 JSON 再次塞進 prompt。REPL 模式下 `notes` 會跨輪累積，在連續問答中維持脈絡。
 
-> **尚未完成**：本節原先規劃的 **Map-Reduce 多段式過篩**（把破表 Context 切批次、平行初篩後再收斂）目前**尚未實作**；觸發 Token Gate 時系統只是提早收手，對「總結整部小說所有大事件」這類真正超量的查詢仍會丟失後段資訊。
->
-> **未來規劃**：導入 **Context Compact 機制**——在 `plan` 節點偵測接近上限時，先啟動一輪 LLM 驅動的 notes 壓縮／去重（類似 Claude Code 的 auto-compact），再決定是否繼續檢索或進入 answer，以此達成真正意義上的無損全本分析。
+> **路線圖：Context Compact 機制** —— 在 `plan` 節點偵測接近上限時，啟動 LLM 驅動的 notes 壓縮／去重（概念類似 Claude Code 的 auto-compact），再決定是否繼續檢索或收斂到 answer。目前以 Token Gate 提前收手作為 v1 策略，優先確保 context 安全；更精細的 **Map-Reduce 多段式過篩**（破表 Context 切批次、平行初篩後再收斂）已列入下一階段，用於「總結整部小說所有大事件」這類真正超量的全本分析查詢。
