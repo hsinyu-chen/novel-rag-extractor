@@ -10,6 +10,7 @@ from processor.scene_summarizer import SceneSummarizer
 from processor.knowledge_agent import KnowledgeAgent
 from modules.book_pre_process import BookPreProcessor
 from modules.knowledge_process import KnowledgeProcess
+from modules.interactive_qa import InteractiveQA
 
 class AppContainer(containers.DeclarativeContainer):
     """
@@ -85,5 +86,12 @@ class AppContainer(containers.DeclarativeContainer):
         storage=storage,
         weaviate_db=weaviate_db,
         agent=knowledge_agent,
+        config=config
+    )
+
+    qa_runner = providers.Singleton(
+        InteractiveQA,
+        weaviate_db=weaviate_db,
+        embed_engine=embed_engine,
         config=config
     )

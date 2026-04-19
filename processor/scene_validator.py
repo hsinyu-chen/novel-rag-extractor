@@ -3,6 +3,7 @@ import json
 from typing import List, Optional, Callable
 
 from processor.llm_engine import NativeLlamaEngine
+from core.prompt_loader import load_prompt
 
 
 class SceneValidator:
@@ -87,10 +88,7 @@ class SceneValidator:
             }
 
             messages = [
-                {"role": "system", "content": (
-                    "你是小說結構分析師。判斷兩段文字是否應該合併為同一個場景段落。\n"
-                    "請嚴格根據敘事連貫性進行判定。"
-                )},
+                {"role": "system", "content": load_prompt("scene/validate_boundaries")},
                 {"role": "user", "content": (
                     f"【片段 1 結尾】：\n{s1_end}\n\n"
                     f"【片段 2 開頭】：\n{s2_begin}\n\n"

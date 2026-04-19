@@ -21,7 +21,10 @@ def main():
     parser.add_argument("--start", type=int, default=1, help="起始集數數字")
     parser.add_argument("--vol", type=int, default=0, help="只跑指定的單一集數")
     parser.add_argument("--clean", action="store_true", help="清除該小說的全部輸出後重跑")
-    parser.add_argument("--mode", type=str, default="ingest", choices=["ingest", "process", "all"])
+    parser.add_argument("--mode", type=str, default="ingest", choices=["ingest", "process", "all", "qa"])
+    parser.add_argument("--prompt", type=str, default="", help="QA 模式：直接帶一次性問題，跑完即退出（留空則進入 REPL）")
+    parser.add_argument("--show-graph", action="store_true", help="QA 模式：印出 LangGraph mermaid 圖")
+    parser.add_argument("--debug", action="store_true", help="QA 模式：顯示 system prompt、tool 參數與原始檢索輸出")
     args = parser.parse_args()
 
     # 2. 載入配置 (ConfigService)
@@ -48,6 +51,17 @@ def main():
         start = args.vol if args.vol else args.start
         end = args.vol if args.vol else 0
         knowledge_processor.run(args.novel, start, end_vol=end, clean_output=args.clean)
+
+    if args.mode == "qa":
+        print(f"\n[Mode: QA] Starting interactive query agent for {args.novel}...")
+        qa_runner = container.qa_runner()
+        qa_runner.run(
+            novel_name=args.novel,
+            prompt=args.prompt,
+            vol=args.vol,
+            show_graph=args.show_graph,
+            debug=args.debug,
+        )
 
 if __name__ == "__main__":
     main()

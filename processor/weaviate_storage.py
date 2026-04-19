@@ -430,6 +430,287 @@ class WeaviateStorage:
         except Exception as e:
             print(f"  [Weaviate] Error clearing chunk volume: {e}")
 
+    def universal_search(
+        self,
+        novel_hash: str,
+        max_vol: int,
+        query_text: str = "",
+        filter_type: str = "",
+        filter_categories: Optional[List[str]] = None,
+        sort_by: str = "relevance",
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        QA Agent 用的萬用條目檢索接口（對應 README §6 的 search_world_knowledge）。
+
+        策略分流：
+          - query_text 留空 → 純 metadata 過濾 + 可選 appearances 排序（列舉模式）
+          - query_text 有值 → 對 content 向量走 hybrid（BM25 + vector）
+        一律過濾 tainted=True 的超級磁鐵條目。
+        """
+        collection = self._client.collections.get("NovelEntity")
+
+        flt = Filter.by_property("novel_hash").equal(novel_hash) & \
+              Filter.by_property("vol_num").less_or_equal(max_vol) & \
+              Filter.by_property("tainted").not_equal(True)
+        if filter_type:
+            flt = flt & Filter.by_property("entity_type").equal(filter_type)
+        if filter_categories:
+            # categories 配置 FIELD tokenization，走 contains_any 做精準匹配
+            flt = flt & Filter.by_property("categories").contains_any(filter_categories)
+
+        results: List[Dict[str, Any]] = []
+        query_text = (query_text or "").strip()
+
+        if not query_text:
+            # 純 metadata 列舉模式 — 不走向量
+            try:
+                # 為了後續 appearances 排序需要足夠候選，先抓 3× limit
+                fetch_limit = max(limit * 3, limit) if sort_by == "appearances" else limit
+                resp = collection.query.fetch_objects(filters=flt, limit=fetch_limit)
+                for obj in resp.objects:
+                    data = self._parse_entity_obj(obj)
+                    results.append(data)
+            except Exception as e:
+                print(f"[Weaviate] universal_search list-mode failed: {e}")
+        else:
+            # 語意模式 — hybrid on content vector
+            try:
+                vec = self.embed_func.embed_query(query_text)
+                resp = collection.query.hybrid(
+                    query=query_text,
+                    vector=vec,
+                    target_vector="content",
+                    alpha=0.5,
+                    filters=flt,
+                    limit=limit,
+                    return_metadata=MetadataQuery(score=True),
+                )
+                for obj in resp.objects:
+                    data = self._parse_entity_obj(obj)
+                    data["_score"] = obj.metadata.score if obj.metadata.score is not None else 0.0
+                    results.append(data)
+            except Exception as e:
+                print(f"[Weaviate] universal_search semantic-mode failed: {e}")
+
+        if sort_by == "appearances":
+            results.sort(key=lambda d: len(d.get("appeared_in") or []), reverse=True)
+            results = results[:limit]
+
+        return results
+
+    def search_scenes(
+        self,
+        novel_hash: str,
+        query_text: str = "",
+        vol_num: int = 0,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        QA Agent 用的場景分片檢索（Layer 1: NovelChunk）。
+
+        - query_text 留空 → 列出指定卷的 scene 摘要（依 scene_index 排序）
+        - query_text 有值 → 對 full_text / summary 向量 hybrid 檢索
+        vol_num=0 表示跨卷。
+        """
+        collection = self._client.collections.get("NovelChunk")
+
+        flt = Filter.by_property("novel_hash").equal(novel_hash)
+        if vol_num and vol_num > 0:
+            flt = flt & Filter.by_property("vol_num").equal(vol_num)
+
+        results: List[Dict[str, Any]] = []
+        query_text = (query_text or "").strip()
+
+        if not query_text:
+            try:
+                resp = collection.query.fetch_objects(filters=flt, limit=limit * 3)
+                tmp = []
+                for obj in resp.objects:
+                    tmp.append({
+                        "vol_num": obj.properties.get("vol_num"),
+                        "scene_index": obj.properties.get("scene_index"),
+                        "title": obj.properties.get("title", ""),
+                        "token_count": obj.properties.get("token_count", 0),
+                    })
+                tmp.sort(key=lambda x: (x.get("vol_num") or 0, x.get("scene_index") or 0))
+                results = tmp[:limit]
+            except Exception as e:
+                print(f"[Weaviate] search_scenes list-mode failed: {e}")
+        else:
+            try:
+                vec = self.embed_func.embed_query(query_text)
+                resp = collection.query.hybrid(
+                    query=query_text,
+                    vector=vec,
+                    target_vector="summary",
+                    alpha=0.5,
+                    filters=flt,
+                    limit=limit,
+                    return_metadata=MetadataQuery(score=True),
+                )
+                for obj in resp.objects:
+                    results.append({
+                        "vol_num": obj.properties.get("vol_num"),
+                        "scene_index": obj.properties.get("scene_index"),
+                        "title": obj.properties.get("title", ""),
+                        "content_excerpt": (obj.properties.get("content", "") or "")[:400],
+                        "_score": obj.metadata.score if obj.metadata.score is not None else 0.0,
+                    })
+            except Exception as e:
+                print(f"[Weaviate] search_scenes semantic-mode failed: {e}")
+
+        return results
+
+    def list_novels(self) -> List[Dict[str, Any]]:
+        """
+        列出資料庫收錄的所有小說及其卷範圍 / chunk / entity 數量。
+        """
+        chunk_col = self._client.collections.get("NovelChunk")
+        entity_col = self._client.collections.get("NovelEntity")
+
+        novels: Dict[str, Dict[str, Any]] = {}
+
+        try:
+            chunk_agg = chunk_col.aggregate.over_all(group_by="novel_hash", total_count=True)
+            for g in chunk_agg.groups:
+                h = g.grouped_by.value
+                if not h:
+                    continue
+                novels[h] = {
+                    "novel_hash": h,
+                    "chunk_count": g.total_count or 0,
+                    "vols": [],
+                    "entity_count": 0,
+                }
+        except Exception as e:
+            print(f"[Weaviate] list_novels chunk-agg failed: {e}")
+
+        # 為每本小說撈 vol 分佈
+        for h, info in novels.items():
+            try:
+                vol_agg = chunk_col.aggregate.over_all(
+                    filters=Filter.by_property("novel_hash").equal(h),
+                    group_by="vol_num",
+                    total_count=True,
+                )
+                vols = []
+                for g in vol_agg.groups:
+                    vols.append({
+                        "vol_num": int(g.grouped_by.value),
+                        "scene_count": g.total_count or 0,
+                    })
+                vols.sort(key=lambda x: x["vol_num"])
+                info["vols"] = vols
+            except Exception as e:
+                print(f"[Weaviate] list_novels vol-agg failed for {h}: {e}")
+
+        # entity 數
+        try:
+            entity_agg = entity_col.aggregate.over_all(group_by="novel_hash", total_count=True)
+            for g in entity_agg.groups:
+                h = g.grouped_by.value
+                if h in novels:
+                    novels[h]["entity_count"] = g.total_count or 0
+        except Exception as e:
+            print(f"[Weaviate] list_novels entity-agg failed: {e}")
+
+        return list(novels.values())
+
+    def get_novel_profile(self, novel_hash: str) -> Dict[str, Any]:
+        """
+        取得單一小說的概況：卷分佈、每類條目數、出場最多的前幾個條目。
+        給 QA Agent 做 system prompt 注入。
+        """
+        chunk_col = self._client.collections.get("NovelChunk")
+        entity_col = self._client.collections.get("NovelEntity")
+
+        profile: Dict[str, Any] = {
+            "novel_hash": novel_hash,
+            "vols": [],
+            "chunk_count": 0,
+            "entity_count": 0,
+            "entity_by_type": {},
+            "top_entities": [],
+        }
+
+        # 卷分佈
+        try:
+            vol_agg = chunk_col.aggregate.over_all(
+                filters=Filter.by_property("novel_hash").equal(novel_hash),
+                group_by="vol_num",
+                total_count=True,
+            )
+            vols = []
+            total = 0
+            for g in vol_agg.groups:
+                cnt = g.total_count or 0
+                vols.append({"vol_num": int(g.grouped_by.value), "scene_count": cnt})
+                total += cnt
+            vols.sort(key=lambda x: x["vol_num"])
+            profile["vols"] = vols
+            profile["chunk_count"] = total
+        except Exception as e:
+            print(f"[Weaviate] get_novel_profile vol-agg failed: {e}")
+
+        # 條目類型分佈
+        try:
+            type_agg = entity_col.aggregate.over_all(
+                filters=Filter.by_property("novel_hash").equal(novel_hash) &
+                        Filter.by_property("tainted").not_equal(True),
+                group_by="entity_type",
+                total_count=True,
+            )
+            type_map: Dict[str, int] = {}
+            for g in type_agg.groups:
+                t = g.grouped_by.value or "unknown"
+                type_map[t] = g.total_count or 0
+            profile["entity_by_type"] = type_map
+            profile["entity_count"] = sum(type_map.values())
+        except Exception as e:
+            print(f"[Weaviate] get_novel_profile type-agg failed: {e}")
+
+        # 出場最多的條目（前 8）
+        try:
+            flt = Filter.by_property("novel_hash").equal(novel_hash) & \
+                  Filter.by_property("tainted").not_equal(True)
+            resp = entity_col.query.fetch_objects(filters=flt, limit=80)
+            rows = []
+            for obj in resp.objects:
+                data = self._parse_entity_obj(obj)
+                rows.append({
+                    "keyword": data.get("keyword"),
+                    "type": data.get("type"),
+                    "appearances": len(data.get("appeared_in") or []),
+                })
+            rows.sort(key=lambda x: x["appearances"], reverse=True)
+            profile["top_entities"] = rows[:8]
+        except Exception as e:
+            print(f"[Weaviate] get_novel_profile top-entities failed: {e}")
+
+        return profile
+
+    def _parse_entity_obj(self, obj) -> Dict[str, Any]:
+        """
+        將 Weaviate 物件轉為精簡 dict（給 QA Agent 看，省 token）。
+        """
+        content_json = obj.properties.get("content", "{}")
+        try:
+            data = json.loads(content_json)
+        except Exception:
+            data = {}
+        return {
+            "uuid": str(obj.uuid),
+            "keyword": data.get("keyword") or obj.properties.get("keyword", ""),
+            "type": data.get("type") or obj.properties.get("entity_type", ""),
+            "aliases": data.get("aliases") or obj.properties.get("aliases", []),
+            "categories": data.get("categories") or obj.properties.get("categories", []),
+            "description": data.get("description") or obj.properties.get("description", ""),
+            "appeared_in": data.get("appeared_in") or obj.properties.get("appeared_in", []),
+            "major_status_changes": data.get("major_status_changes", []),
+            "vol_num": obj.properties.get("vol_num"),
+        }
+
     def get_existing_entity_types(self) -> List[str]:
         """
         取得資料庫目前已經收錄過的所有 entity_type 列表 (減少 LLM 重複造詞)

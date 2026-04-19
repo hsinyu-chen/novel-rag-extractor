@@ -23,6 +23,13 @@ class PipelineConfig:
     rag_identity_keep: float
     rag_content_strong: float
     rag_content_min: float
+    # QA Agent FSM 參數
+    qa_max_ctx_tokens: int
+    qa_ctx_gate: float
+    qa_max_iter: int
+    qa_temp: float
+    qa_top_p: float
+    qa_top_k: int
 
 class ConfigService:
     """
@@ -60,5 +67,13 @@ class ConfigService:
             rag_identity_strong=float(os.getenv("RAG_IDENTITY_STRONG", 0.75)),
             rag_identity_keep=float(os.getenv("RAG_IDENTITY_KEEP", 0.62)),
             rag_content_strong=float(os.getenv("RAG_CONTENT_STRONG", 0.35)),
-            rag_content_min=float(os.getenv("RAG_CONTENT_MIN", 0.10))
+            rag_content_min=float(os.getenv("RAG_CONTENT_MIN", 0.10)),
+
+            # QA Agent FSM (llama-server 預設 8K ctx；調大的話同步改這裡)
+            qa_max_ctx_tokens=int(os.getenv("QA_MAX_CTX_TOKENS", 65536)),
+            qa_ctx_gate=float(os.getenv("QA_CTX_GATE", 0.7)),
+            qa_max_iter=int(os.getenv("QA_MAX_ITER", 8)),
+            qa_temp=float(os.getenv("QA_TEMP", 1.0)),
+            qa_top_p=float(os.getenv("QA_TOP_P", 0.95)),
+            qa_top_k=int(os.getenv("QA_TOP_K", 64)),
         )
