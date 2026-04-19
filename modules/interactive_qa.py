@@ -7,6 +7,8 @@ from rich.panel import Panel
 from rich.markdown import Markdown
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, BaseMessage
 
+_RETRIEVED_NOTES_TOOL = "retrieved_notes"
+
 from processor.query_agent import QueryAgent, DEFAULT_SYSTEM
 from processor.query_tool import build_query_tools
 from processor.weaviate_storage import WeaviateStorage
@@ -129,7 +131,7 @@ class InteractiveQA:
             model=self.conf.get("summary_model"),
             tools=tools,
             tokenize_fn=self.embed_engine.tokenize,
-            max_ctx_tokens=int(self.conf.get("qa_max_ctx_tokens", 8192)),
+            max_ctx_tokens=int(self.conf.get("qa_max_ctx_tokens", 65536)),
             ctx_gate=float(self.conf.get("qa_ctx_gate", 0.7)),
             max_iter=int(self.conf.get("qa_max_iter", 20)),
             temperature=float(self.conf.get("qa_temp", 1.0)),
@@ -144,20 +146,18 @@ class InteractiveQA:
         question: str,
         system_prompt: str = None,
         history_messages: List[BaseMessage] = None,
-        prior_notes: List[str] = None,
         debug: bool = False,
     ):
-        state = agent.initial_state(question, system=system_prompt)
-        if history_messages:
-            # 將過往 Q&A 插在 system 與本輪問題之間，供 plan 節點看到脈絡
-            state["messages"] = [state["messages"][0]] + list(history_messages) + [state["messages"][1]]
-        if prior_notes:
-            state["notes"] = list(prior_notes)
+        state = agent.initial_state(
+            question,
+            system=system_prompt,
+            history_messages=history_messages,
+        )
 
         last_msg_count = len(state["messages"])
-        notes_so_far: List[str] = list(prior_notes or [])
+        notes_so_far: List[str] = []
         final_answer = ""
-        final_notes: List[str] = list(notes_so_far)
+        final_notes: List[str] = []
         thinking_printed = False
 
         self.console.rule(f"[bold cyan]Question[/bold cyan]")
@@ -286,9 +286,9 @@ class InteractiveQA:
                     pass
             return
 
-        # REPL（連續問答：保留前幾輪 Q&A 與累積的 notes 作為下一輪 context）
+        # REPL（連續問答：每輪把 [Q, 合成 tool pair(本輪 notes), Answer] 自然附加到 history，
+        # 下一輪 plan 就看得到「這輪問了什麼、查到什麼、答了什麼」，不需特別的 historical_notes 機制）
         history_messages: List[BaseMessage] = []
-        accumulated_notes: List[str] = []
         self.console.print("[dim]輸入問題後 Enter；輸入 'exit' 或 Ctrl+C 結束；':reset' 清空對話紀錄。[/dim]")
         while True:
             try:
@@ -303,7 +303,6 @@ class InteractiveQA:
                 return
             if q.lower() == ":reset":
                 history_messages = []
-                accumulated_notes = []
                 self.console.print("[dim](對話紀錄已清空)[/dim]")
                 continue
             try:
@@ -312,11 +311,25 @@ class InteractiveQA:
                     q,
                     system_prompt=system_prompt,
                     history_messages=history_messages,
-                    prior_notes=accumulated_notes,
                     debug=debug,
                 )
+                tool_call_id = f"retrieved_notes_turn_{len(history_messages) // 4 + 1}"
+                notes_block = "\n\n".join(final_notes) if final_notes else "（本輪未進行工具檢索。）"
                 history_messages.append(HumanMessage(content=q))
+                history_messages.append(AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "id": tool_call_id,
+                        "name": _RETRIEVED_NOTES_TOOL,
+                        "args": {"question": q},
+                        "type": "tool_call",
+                    }],
+                ))
+                history_messages.append(ToolMessage(
+                    tool_call_id=tool_call_id,
+                    name=_RETRIEVED_NOTES_TOOL,
+                    content=notes_block,
+                ))
                 history_messages.append(AIMessage(content=final_answer or ""))
-                accumulated_notes = final_notes
             except Exception as e:
                 self.console.print(f"[red]Error: {e}[/red]")

@@ -102,7 +102,7 @@ def build_query_tools(weaviate_db: WeaviateStorage, storage: Optional[JsonStorag
     回傳格式統一為 YAML（block style），自動剔除 uuid 與內部 RAG 分數欄位。
     """
 
-    def _search_world_knowledge(
+    def _find_entity_scenes(
         query_text: str = "",
         novel_hash: str = "",
         filter_type: str = "",
@@ -123,15 +123,35 @@ def build_query_tools(weaviate_db: WeaviateStorage, storage: Optional[JsonStorag
             return _dump({"hits": 0, "items": []})
         slim = []
         for r in results:
+            appeared = list(r.get("appeared_in") or [])
+            nh = r.get("novel_hash") or ""
+            vn = r.get("vol_num") or 0
+            scenes_preview = []
+            for sidx in appeared[:8]:
+                if sidx is None or not nh or not vn:
+                    continue
+                try:
+                    scene = weaviate_db.get_scene_content(
+                        novel_hash=nh, vol_num=int(vn), scene_index=int(sidx)
+                    )
+                except Exception:
+                    scene = None
+                if not scene:
+                    continue
+                scenes_preview.append({
+                    "vol_num": scene.get("vol_num"),
+                    "scene_index": scene.get("scene_index"),
+                    "title": scene.get("title") or "",
+                })
             slim.append({
                 "keyword": r.get("keyword"),
                 "type": r.get("type"),
-                "novel_hash": r.get("novel_hash"),
-                "vol_num": r.get("vol_num"),
+                "novel_hash": nh,
+                "vol_num": vn,
                 "aliases": r.get("aliases") or [],
                 "categories": r.get("categories") or [],
-                "description": (r.get("description") or "")[:500],
-                "appeared_in_count": len(r.get("appeared_in") or []),
+                "appeared_in_count": len(appeared),
+                "scenes": scenes_preview,
             })
         return _dump({"hits": len(slim), "items": slim})
 
@@ -170,12 +190,13 @@ def build_query_tools(weaviate_db: WeaviateStorage, storage: Optional[JsonStorag
         return _dump({"found": True, **_strip_internal(data)})
 
     world_tool = StructuredTool.from_function(
-        func=_search_world_knowledge,
-        name="search_world_knowledge",
+        func=_find_entity_scenes,
+        name="find_entity_scenes",
         description=(
-            "查詢小說世界觀知識庫（人物、地點、物品、概念），可跨多部小說檢索。"
-            "novel_hash 留空 → 跨 DB；帶 hash → 鎖定單一作品。"
-            "query_text 留空 + filter_categories 或 sort_by=appearances 可做精準列舉。"
+            "依條件找條目並回傳其關聯場景索引：條目名 / 類型 / 分類 / 出場次數 + "
+            "`scenes=[{vol_num, scene_index, title},...]`（場景定位錨點，title 為該場景的 AI 摘要）。"
+            "**不回條目敘述、也不回場景原文**；本工具只負責定位，細節請接 `get_scene_content` 讀原文。"
+            "novel_hash 留空 → 跨 DB；優先用 filter_type / filter_categories / sort_by=appearances 精準列舉，避免只靠 query_text。"
             "回傳 YAML 格式。"
         ),
         args_schema=SearchWorldKnowledgeArgs,
@@ -184,9 +205,10 @@ def build_query_tools(weaviate_db: WeaviateStorage, storage: Optional[JsonStorag
         func=_search_scenes,
         name="search_scenes",
         description=(
-            "查詢場景分片的劇情摘要（Layer 1 chunks），可跨多部小說。"
-            "novel_hash 留空 → 跨 DB；vol_num=0 → 跨卷；query_text 留空則列舉範圍內的 scene 大綱。"
-            "只回 title + 400 字摘要；需要原文對話、暱稱、細節請接著用 get_scene_content。"
+            "查詢場景分片（Layer 1 NovelChunk）作為定位錨點，可跨多部小說。"
+            "novel_hash 留空 → 跨 DB；vol_num=0 → 跨卷；query_text 留空則列舉範圍內的 scene。"
+            "回 title（AI 生成摘要）+ content_excerpt（原文前 400 字節錄）；"
+            "節錄只夠判斷該場景是否值得展開，需要完整對話 / 暱稱 / 招式細節請接著用 get_scene_content 取整段原文。"
             "回傳 YAML 格式。"
         ),
         args_schema=SearchScenesArgs,
@@ -230,7 +252,7 @@ def build_query_tools(weaviate_db: WeaviateStorage, storage: Optional[JsonStorag
             description=(
                 "取某部小說某卷的 2-pass 卷摘要（主題 / 主角 / 主要角色 / 地點 / 大綱 / 主線 / 未解伏筆）。"
                 "適合 meta 類問題：『這本書在講什麼』『主角是誰』『主要角色』『劇情大綱』等 —— "
-                "比 search_world_knowledge 更快、更聚焦。找不到會回 found=false，此時改走 search_* 組合。"
+                "比 find_entity_scenes 更快、更聚焦。找不到會回 found=false，此時改走 search_* 組合。"
                 "回傳 YAML 格式。"
             ),
             args_schema=GetVolSummaryArgs,

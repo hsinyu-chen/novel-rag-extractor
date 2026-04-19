@@ -1,4 +1,5 @@
 import operator
+import re
 from typing import TypedDict, Annotated, List, Optional, Literal
 from langchain_core.messages import (
     BaseMessage, SystemMessage, HumanMessage, AIMessage, ToolMessage
@@ -22,7 +23,22 @@ class QAState(TypedDict):
 
 
 DEFAULT_SYSTEM = load_prompt("query/agent_system")
-ANSWER_SYSTEM = load_prompt("query/answer_system")
+
+
+def _strip_tool_call_tokens(text: str) -> str:
+    """兜底：Gemma chat template 偶爾把 tool_call 的特殊 token 原樣落進 content，
+    清掉 <|tool_call>...<tool_call|> / <tool_call>...</tool_call> 之類殘留。"""
+    if not text:
+        return text
+    patterns = [
+        r"<\|?tool_call\|?>.*?<\|?/?tool_call\|?>",   # <|tool_call>...<tool_call|> 等變體
+        r"<\|tool_call\|>.*?<\|/tool_call\|>",
+        r"<tool_call>.*?</tool_call>",
+    ]
+    out = text
+    for p in patterns:
+        out = re.sub(p, "", out, flags=re.DOTALL)
+    return out.strip()
 
 
 class QueryAgent:
@@ -35,6 +51,11 @@ class QueryAgent:
          └──無 tool_calls / 強制切換──► answer ──► END
 
     強制切換條件：token_ratio >= ctx_gate（預設 0.7），或 iteration >= max_iter。
+
+    所有節點共用同一份 system prompt（由 initial_state 指定，預設 DEFAULT_SYSTEM）。
+    answer 節點不沿用 plan 的 messages，而是只消費 `notes`（take_notes 整理過的
+    工具結果摘要）+ 原始問題，並走未綁工具的 LLM 產最終答案 —
+    避免 tool_call 配對問題與原始 JSON 膨脹 prompt。
     """
 
     def __init__(
@@ -44,9 +65,9 @@ class QueryAgent:
         model: str,
         tools: List[BaseTool],
         tokenize_fn=None,
-        max_ctx_tokens: int = 8192,
+        max_ctx_tokens: int = 65536,
         ctx_gate: float = 0.7,
-        max_iter: int = 8,
+        max_iter: int = 20,
         temperature: float = 0.3,
         top_p: float = 0.95,
         top_k: int = 0,
@@ -119,49 +140,48 @@ class QueryAgent:
         return {"notes": new_notes}
 
     def _answer_node(self, state: QAState) -> dict:
-        # 沿用 plan 階段的 messages（含原 system + 全部 tool 呼叫 / 結果），
-        # 僅在尾巴追加 Answer Mode 指令，最大化 llama-server KV-cache 前綴重用。
-        # 若 LLM 仍嘗試呼叫工具，以 ToolMessage 駁回後重試（最多 3 次）。
-        msgs: List[BaseMessage] = list(state["messages"])
-
-        # Edge case：token/iter 上限切換 answer 時，plan 的最後一則 AIMessage 可能還掛著
-        # 未執行的 tool_calls，屬於 OpenAI 無效狀態；補合成 ToolMessage 收尾。
-        last = msgs[-1] if msgs else None
-        if isinstance(last, AIMessage) and last.tool_calls:
-            for tc in last.tool_calls:
-                msgs.append(ToolMessage(
-                    tool_call_id=tc.get("id", ""),
-                    name=tc.get("name", ""),
-                    content="Answer Mode：已達 token/iteration 上限，本次檢索略過。",
-                ))
-
-        directive = ANSWER_SYSTEM + (
-            f"\n\n---\n【使用者原始問題】\n{state['question']}\n\n"
-            "請立刻依上述規則輸出對這個問題的最終答案文字，不要回覆「已切換模式」之類的確認語。"
+        # 把整理好的 notes 包裝成一對合成的 tool_call / tool_result 餵給未綁工具的 self.llm，
+        # 讓 LLM 以「檢索工具剛剛回傳這批事實」的訓練分佈來消費，而不是把 notes 當成
+        # 使用者提供的素材（避免『根據您提供的資料…』這類語氣偏差）。
+        # 結尾再補一則 HumanMessage redirect → 把模型從「tool-loop」情境拉回
+        # 「使用者要答案」情境，避免 Gemma chat template 把對話尾端是 ToolMessage
+        # 誤讀成「該再發 tool_call」而吐出 <|tool_call> 原始模板 token。
+        system_msg = next(
+            (m for m in state["messages"] if isinstance(m, SystemMessage)),
+            SystemMessage(content=DEFAULT_SYSTEM),
         )
-        msgs.append(HumanMessage(content=directive))
+        notes = state.get("notes", []) or []
+        notes_block = "\n\n".join(notes) if notes else "（本次未進行工具檢索。）"
 
-        for attempt in range(3):
-            ai = self.llm_with_tools.invoke(msgs)
-            tool_calls = getattr(ai, "tool_calls", None) or []
-            if not tool_calls:
-                return {"final_answer": ai.content or ""}
+        tool_call_id = "retrieved_notes_bundle"
+        synthetic_ai = AIMessage(
+            content="",
+            tool_calls=[{
+                "id": tool_call_id,
+                "name": "retrieved_notes",
+                "args": {"question": state["question"]},
+                "type": "tool_call",
+            }],
+        )
+        synthetic_tool = ToolMessage(
+            tool_call_id=tool_call_id,
+            name="retrieved_notes",
+            content=notes_block,
+        )
+        redirect = HumanMessage(content=(
+            "以上是檢索工具回傳的事實。請直接依 system prompt 規則，以自然語言輸出對原始問題"
+            f"「{state['question']}」的最終答案，**不要再呼叫任何工具、不要輸出 <tool_call> 之類的模板標記**。"
+        ))
 
-            # LLM 違反 Answer Mode，仍輸出 tool_calls → 合規駁回並要求直接回答
-            msgs.append(ai)
-            for tc in tool_calls:
-                msgs.append(ToolMessage(
-                    tool_call_id=tc.get("id", ""),
-                    name=tc.get("name", ""),
-                    content="Answer Mode：工具呼叫被拒。請勿再呼叫工具，直接輸出最終答案文字。",
-                ))
-            msgs.append(HumanMessage(content=(
-                f"上述工具呼叫已被系統駁回（Answer Mode 禁止呼叫工具，重試 {attempt + 1}/3）。"
-                f"請立刻改輸出針對原始問題「{state['question']}」的純文字答案，"
-                "不要再包含任何 tool_calls。"
-            )))
-
-        return {"final_answer": "(answer mode: LLM 反覆嘗試呼叫工具，已中止)"}
+        ai = self.llm.invoke([
+            system_msg,
+            HumanMessage(content=state["question"]),
+            synthetic_ai,
+            synthetic_tool,
+            redirect,
+        ])
+        content = _strip_tool_call_tokens(ai.content or "")
+        return {"final_answer": content}
 
     # ---------- Routing ----------
     def _route_after_plan(self, state: QAState) -> Literal["tool", "answer"]:
@@ -193,12 +213,29 @@ class QueryAgent:
         return g.compile()
 
     # ---------- Public ----------
-    def initial_state(self, question: str, system: Optional[str] = None) -> QAState:
+    def initial_state(
+        self,
+        question: str,
+        system: Optional[str] = None,
+        history_messages: Optional[List[BaseMessage]] = None,
+    ) -> QAState:
+        """
+        建立一次 graph run 的初始 state。
+
+        history_messages 應已包含前幾輪的 `[HumanMsg_q, synthetic_ai(tool_call), synthetic_tool(notes), AIMsg_ans]`
+        自然對話流；本方法不再做特別的歷史 notes 重打包。每輪 `state["notes"]` 只收集本輪新產生的 notes。
+        """
         system_msg = SystemMessage(content=system or DEFAULT_SYSTEM)
         user_msg = HumanMessage(content=question)
+
+        msgs: List[BaseMessage] = [system_msg]
+        if history_messages:
+            msgs.extend(history_messages)
+        msgs.append(user_msg)
+
         return {
             "question": question,
-            "messages": [system_msg, user_msg],
+            "messages": msgs,
             "notes": [],
             "iteration": 0,
             "token_ratio": 0.0,

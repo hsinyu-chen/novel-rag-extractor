@@ -23,6 +23,10 @@ class PipelineConfig:
     rag_identity_keep: float
     rag_content_strong: float
     rag_content_min: float
+    # Taint Detection 結構性閾值 (超級磁鐵防線)
+    entity_alias_cap: int
+    entity_description_cap: int
+    entity_semantic_gate: float
     # QA Agent FSM 參數
     qa_max_ctx_tokens: int
     qa_ctx_gate: float
@@ -68,6 +72,11 @@ class ConfigService:
             rag_identity_keep=float(os.getenv("RAG_IDENTITY_KEEP", 0.62)),
             rag_content_strong=float(os.getenv("RAG_CONTENT_STRONG", 0.35)),
             rag_content_min=float(os.getenv("RAG_CONTENT_MIN", 0.10)),
+
+            # Taint Detection 結構性閾值（超出即視為「超級磁鐵」標記 tainted）
+            entity_alias_cap=int(os.getenv("ENTITY_ALIAS_CAP", 8)),
+            entity_description_cap=int(os.getenv("ENTITY_DESCRIPTION_CAP", 800)),
+            entity_semantic_gate=float(os.getenv("ENTITY_SEMANTIC_GATE", 0.75)),
 
             # QA Agent FSM (llama-server 預設 8K ctx；調大的話同步改這裡)
             qa_max_ctx_tokens=int(os.getenv("QA_MAX_CTX_TOKENS", 65536)),
