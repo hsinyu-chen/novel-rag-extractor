@@ -11,6 +11,7 @@ from processor.query_agent import QueryAgent, DEFAULT_SYSTEM
 from processor.query_tool import build_query_tools
 from processor.weaviate_storage import WeaviateStorage
 from processor.embed_engine import LlamaSimpleEmbeddings
+from processor.json_storage import JsonStorage
 
 
 class InteractiveQA:
@@ -22,10 +23,12 @@ class InteractiveQA:
         self,
         weaviate_db: WeaviateStorage,
         embed_engine: LlamaSimpleEmbeddings,
+        storage: JsonStorage,
         config: Any,
     ):
         self.weaviate_db = weaviate_db
         self.embed_engine = embed_engine
+        self.storage = storage
         self.conf = config
         self.console = Console()
 
@@ -49,6 +52,14 @@ class InteractiveQA:
                 except Exception:
                     continue
         return max_vol or 1
+
+    def _list_summary_vols(self, novel_hash: str, vol_nums: list) -> list:
+        """掃 output/{hash}/summary/vol_N.json，列出已生成 2-pass 摘要的卷。"""
+        done = []
+        for v in vol_nums:
+            if self.storage.get(f"{novel_hash}.summary.vol_{v}"):
+                done.append(v)
+        return done
 
     def _scan_novel_titles(self) -> dict:
         """掃 data/ 下的資料夾，回傳 {hash: folder_name} 映射（hash 由路徑 md5 生成）。"""
@@ -79,9 +90,11 @@ class InteractiveQA:
             vols = n.get("vols") or []
             vol_nums = [v["vol_num"] for v in vols]
             marker = "  ← 使用者此次主要關心" if preferred_hash and h == preferred_hash else ""
+            summary_vols = self._list_summary_vols(h, vol_nums)
+            sum_str = f" | summary_vols={summary_vols}" if summary_vols else " | summary_vols=(無)"
             db_lines.append(
                 f"  - 《{title}》 | hash={h} | vols={vol_nums or '(無)'} | "
-                f"scenes={n.get('chunk_count', 0)} | entities={n.get('entity_count', 0)}{marker}"
+                f"scenes={n.get('chunk_count', 0)} | entities={n.get('entity_count', 0)}{sum_str}{marker}"
             )
 
         if preferred_hash:
@@ -108,7 +121,7 @@ class InteractiveQA:
         return context_block + "\n\n" + DEFAULT_SYSTEM
 
     def _build_agent(self) -> QueryAgent:
-        tools = build_query_tools(self.weaviate_db)
+        tools = build_query_tools(self.weaviate_db, storage=self.storage)
         # 用 SUMMARY_* 這組 config 當作 QA LLM 入口（同一台 llama-server）
         return QueryAgent(
             base_url=self.conf.get("summary_base_url"),

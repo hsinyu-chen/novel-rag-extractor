@@ -569,6 +569,56 @@ class WeaviateStorage:
 
         return results
 
+    def get_scene_content(self, novel_hash: str, vol_num: int, scene_index: int) -> Optional[Dict[str, Any]]:
+        """
+        按 (novel_hash, vol_num, scene_index) 直接抓單一 scene 的完整原文。
+        用 deterministic UUID 走 fetch_object_by_id，零查詢成本。
+        """
+        if not novel_hash or not vol_num or scene_index is None:
+            return None
+        collection = self._client.collections.get("NovelChunk")
+        target_uuid = self.chunk_uuid(novel_hash, int(vol_num), int(scene_index))
+        try:
+            obj = collection.query.fetch_object_by_id(target_uuid)
+        except Exception as e:
+            print(f"[Weaviate] get_scene_content failed: {e}")
+            return None
+        if obj is None:
+            return None
+        return {
+            "novel_hash": obj.properties.get("novel_hash", ""),
+            "vol_num": obj.properties.get("vol_num"),
+            "scene_index": obj.properties.get("scene_index"),
+            "title": obj.properties.get("title", ""),
+            "content": obj.properties.get("content", ""),
+            "token_count": obj.properties.get("token_count", 0),
+        }
+
+    def get_scene_content(self, novel_hash: str, vol_num: int, scene_index: int) -> Optional[Dict[str, Any]]:
+        """
+        按 (novel_hash, vol_num, scene_index) 直接抓單一 scene 的完整原文。
+        用 deterministic UUID 走 fetch_object_by_id，無需查詢過濾。
+        """
+        if not novel_hash or not vol_num or scene_index is None:
+            return None
+        collection = self._client.collections.get("NovelChunk")
+        target_uuid = self.chunk_uuid(novel_hash, int(vol_num), int(scene_index))
+        try:
+            obj = collection.query.fetch_object_by_id(target_uuid)
+        except Exception as e:
+            print(f"[Weaviate] get_scene_content failed: {e}")
+            return None
+        if obj is None:
+            return None
+        return {
+            "novel_hash": obj.properties.get("novel_hash", ""),
+            "vol_num": obj.properties.get("vol_num"),
+            "scene_index": obj.properties.get("scene_index"),
+            "title": obj.properties.get("title", ""),
+            "content": obj.properties.get("content", ""),
+            "token_count": obj.properties.get("token_count", 0),
+        }
+
     def list_novels(self) -> List[Dict[str, Any]]:
         """
         列出資料庫收錄的所有小說及其卷範圍 / chunk / entity 數量。

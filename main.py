@@ -21,7 +21,7 @@ def main():
     parser.add_argument("--start", type=int, default=1, help="起始集數數字")
     parser.add_argument("--vol", type=int, default=0, help="只跑指定的單一集數")
     parser.add_argument("--clean", action="store_true", help="清除該小說的全部輸出後重跑")
-    parser.add_argument("--mode", type=str, default="ingest", choices=["ingest", "process", "all", "qa"])
+    parser.add_argument("--mode", type=str, default="ingest", choices=["ingest", "process", "summary", "all", "qa"])
     parser.add_argument("--prompt", type=str, default="", help="QA 模式：直接帶一次性問題，跑完即退出（留空則進入 REPL）")
     parser.add_argument("--show-graph", action="store_true", help="QA 模式：印出 LangGraph mermaid 圖")
     parser.add_argument("--debug", action="store_true", help="QA 模式：顯示 system prompt、tool 參數與原始檢索輸出")
@@ -37,7 +37,7 @@ def main():
     container.config.from_dict(asdict(config))
     
     # 4. 根據模式執行業務 (Resolve and Run)
-    if args.mode in ["ingest", "process", "all"] and not args.novel:
+    if args.mode in ["ingest", "process", "summary", "all"] and not args.novel:
         parser.error(f"--novel is required for --mode {args.mode}")
 
     if args.mode in ["ingest", "all"]:
@@ -55,6 +55,13 @@ def main():
         end = args.vol if args.vol else 0
         knowledge_processor.run(args.novel, start, end_vol=end, clean_output=args.clean)
 
+    if args.mode in ["summary", "all"]:
+        print(f"\n[Mode: Summary] Starting 2-pass volume summary reducer for {args.novel}...")
+        summary_processor = container.summary_processor()
+        start = args.vol if args.vol else args.start
+        end = args.vol if args.vol else 0
+        summary_processor.run(args.novel, start_vol=start, end_vol=end, clean_output=args.clean)
+
     if args.mode == "qa":
         scope = args.novel if args.novel else "all novels"
         print(f"\n[Mode: QA] Starting interactive query agent (scope: {scope})...")
@@ -66,6 +73,11 @@ def main():
             show_graph=args.show_graph,
             debug=args.debug,
         )
+
+    try:
+        container.weaviate_db().close()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()

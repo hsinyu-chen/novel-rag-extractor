@@ -8,8 +8,10 @@ from processor.embed_engine import LlamaSimpleEmbeddings
 from processor.scene_validator import SceneValidator
 from processor.scene_summarizer import SceneSummarizer
 from processor.knowledge_agent import KnowledgeAgent
+from processor.summary_agent import SummaryAgent
 from modules.book_pre_process import BookPreProcessor
 from modules.knowledge_process import KnowledgeProcess
+from modules.summary_process import SummaryProcess
 from modules.interactive_qa import InteractiveQA
 
 class AppContainer(containers.DeclarativeContainer):
@@ -89,9 +91,23 @@ class AppContainer(containers.DeclarativeContainer):
         config=config
     )
 
+    summary_agent = providers.Singleton(
+        SummaryAgent,
+        engine=llm_engine
+    )
+
+    summary_processor = providers.Singleton(
+        SummaryProcess,
+        storage=storage,
+        weaviate_db=weaviate_db,
+        agent=summary_agent,
+        config=config
+    )
+
     qa_runner = providers.Singleton(
         InteractiveQA,
         weaviate_db=weaviate_db,
         embed_engine=embed_engine,
+        storage=storage,
         config=config
     )
