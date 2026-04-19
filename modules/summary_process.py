@@ -13,10 +13,12 @@ from processor.summary_agent import SummaryAgent, blank_summary
 
 class SummaryProcess:
     """
-    2-pass 卷摘要管線：逐 scene 讀原文、把 LLM 維護的卷級 meta 表格 reduce 到收斂。
+    卷摘要 pass 2 + pass 3 管線：
+      - Pass 2 (`update_summary`)：逐 scene 讀原文，每場呼叫 LLM 直接 reduce 出結構化卷摘要 JSON。
+      - Pass 3 (`compact_background`)：pass 2 跑完後額外重寫 `protagonist.background`，避免逐場累積成編年史。
 
-    - 狀態檔：output/{novel_hash}/summary/vol_{N}.json（含 updated_scenes，可斷點續跑）
-    - 來源：優先從 Weaviate NovelChunk（全文保證一致），失敗 fallback 到 JsonStorage 的 scene 檔
+    - 狀態檔：output/{novel_hash}/summary/vol_{N}.json（含 updated_scenes 與 compacted 旗標，可斷點續跑）
+    - 來源：從 Weaviate NovelChunk fetch（全文保證與 ingest 一致）
     """
 
     def __init__(
