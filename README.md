@@ -1,4 +1,4 @@
-# Novel RAG Pipeline — 中文小說 RAG 預處理系統
+# novel-rag-extractor — 中文小說 RAG 預處理系統
 
 ## 介紹
 
