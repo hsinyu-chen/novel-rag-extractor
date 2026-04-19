@@ -50,6 +50,18 @@ class InteractiveQA:
                     continue
         return max_vol or 1
 
+    def _scan_novel_titles(self) -> dict:
+        """掃 data/ 下的資料夾，回傳 {hash: folder_name} 映射（hash 由路徑 md5 生成）。"""
+        mapping = {}
+        data_dir = "data"
+        if not os.path.isdir(data_dir):
+            return mapping
+        for name in os.listdir(data_dir):
+            full = os.path.join(data_dir, name)
+            if os.path.isdir(full):
+                mapping[self._get_path_hash(full)] = name
+        return mapping
+
     def _build_system_prompt(self, preferred_novel: str = "", preferred_hash: str = "") -> str:
         """列出全庫所有小說讓 agent 自由挑選 novel_hash。"""
         db_novels = []
@@ -58,14 +70,17 @@ class InteractiveQA:
         except Exception as e:
             print(f"[InteractiveQA] list_novels failed: {e}")
 
+        hash_to_title = self._scan_novel_titles()
+
         db_lines = [f"【資料庫收錄】共 {len(db_novels)} 部小說（呼叫工具時可用 novel_hash 鎖定，留空即跨 DB）："]
         for n in db_novels:
             h = n.get("novel_hash", "")
+            title = hash_to_title.get(h, "(書名未知)")
             vols = n.get("vols") or []
             vol_nums = [v["vol_num"] for v in vols]
             marker = "  ← 使用者此次主要關心" if preferred_hash and h == preferred_hash else ""
             db_lines.append(
-                f"  - hash={h} | vols={vol_nums or '(無)'} | "
+                f"  - 《{title}》 | hash={h} | vols={vol_nums or '(無)'} | "
                 f"scenes={n.get('chunk_count', 0)} | entities={n.get('entity_count', 0)}{marker}"
             )
 
@@ -153,6 +168,15 @@ class InteractiveQA:
 
             for m in new_msgs:
                 if isinstance(m, AIMessage):
+                    # debug 模式秀出 Gemma 的 reasoning_content（enable_thinking 生效證據）
+                    if debug:
+                        extra = getattr(m, "additional_kwargs", {}) or {}
+                        reasoning = extra.get("reasoning_content") or extra.get("reasoning") or ""
+                        if reasoning:
+                            snippet = reasoning.strip()
+                            if len(snippet) > 400:
+                                snippet = snippet[:400] + "..."
+                            self.console.print(f"  [dim italic][CoT][/dim italic] [dim]{snippet}[/dim]")
                     tcs = m.tool_calls or []
                     if tcs:
                         for tc in tcs:

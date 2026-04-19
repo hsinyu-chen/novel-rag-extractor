@@ -76,13 +76,132 @@ agent 正在整理回答...
 ╰───────────────────────────────────────────────────────────────────────╯
 ```
 
+### 範例 3：劇情挫折與作品調性判讀
+
+```
+> uv run python main.py --mode qa --prompt "'爆肝'的主角在第一集中遇到什麼挫折?這是純爽文嗎"
+
+>> QA Agent  scope=全庫跨 DB
+─────────────────────────────── Question ───────────────────────────────
+'爆肝'的主角在第一集中遇到什麼挫折?這是純爽文嗎
+─────────────────────────────────────────────────────────────────────────
+agent 正在思考...
+agent 正在查詢 search_scenes...
+agent 正在查詢 search_world_knowledge...
+agent 正在整理回答...
+──────────────────────────────── Answer ────────────────────────────────
+╭───────────────────────────────────────────────────────────────────────╮
+│ 主角在第一章的挫折                                                    │
+│                                                                       │
+│ 主角在第一集中引發大規模隕石暴降以攻擊敵人後,遭遇了劇痛,              │
+│ 隨後失去意識,並被隨之而來的沙塵巨浪吞沒。                             │
+│                                                                       │
+│ 關於是否為純爽文                                                      │
+│                                                                       │
+│ 根據資料庫內容判斷,這部作品不屬於純爽文。在第一卷中,                  │
+│ 主角的經歷包含以下非純爽的元素:                                       │
+│                                                                       │
+│  • 負面事件與傷害: 主角在發動隕石攻擊後,遭受了劇痛並失去了意識。      │
+│  • 殘暴的衝突: 在城市廣場上,有魔族伍斯撕裂了胖子神官長,               │
+│    導致主角因眼前的殘暴行為而喪失了反應。                             │
+│  • 社會層面的威脅: 主角遭遇了神官利用「積功德」等名義                 │
+│    煽動民眾攻擊獸娘的暴動事件,顯示了社會和政治層面的陰謀與問題。      │
+│  • 持續的致命威脅: 即使魔王已被討伐,當地人也得知                      │
+│    真正的威脅是可怕的飛龍。                                           │
+╰───────────────────────────────────────────────────────────────────────╯
+```
+
 上述範例實際體現了本系統的幾個核心設計價值：
 
 - **Agent 自主多輪檢索**：QA Agent 自行決定連續呼叫 `search_world_knowledge` 多次 + `search_scenes` 一次，將條目檢索與原文 scene 檢索交叉比對後再整合回答。
 - **跨書系全庫問答**：`scope=全庫跨 DB` 表示主角雖不知道「爆肝」指的是哪一本書，系統仍能透過 `novel_hash` 過濾自動鎖定該作品 (《爆肝工程師的異世界狂想曲》) 並回溯對應條目。
 - **條目層 + Scene 層雙軌召回**：稱號、介面、戰鬥能力分別散落於不同 Entity 與原文分片中，靠 Layer 1/Layer 2 的雙向鏈結 (`chunk_refs` ⇄ `entity_refs`) 才能拼出完整能力輪廓。
 
-> ⚠️ 系統還在調教中，目前查詢效果還可以再優化。
+> 系統還在調教中，目前查詢效果還可以再優化。
+
+---
+
+## 配置與使用說明
+
+> **本專案尚未完全完成，部分功能（特別是條目合併與 QA Agent 多輪推理）在邊緣題材下可能出現不穩定行為，請以實驗性工具視之。**
+
+### 前置需求
+
+- Python **3.11+**，建議使用 [`uv`](https://docs.astral.sh/uv/) 管理依賴。
+- 一組 **Weaviate v4** server , 必須啟用GSE（本機 Docker 或遠端皆可）。
+- **OpenAI 相容 API** 端點各一，分別供 LLM (Gemma 4 等 chat model) 與 Embedding (`multilingual-e5-large`) 使用。本機可以 [`llama-server`](https://github.com/ggml-org/llama.cpp) 起雙 port。
+- 硬體建議：**8GB VRAM 以上** GPU（用於 Gemma-4 E4B Q4_K_M + e5-large f16 同機跑）。
+
+### 安裝
+
+```bash
+git clone <repo>
+cd <repo path>
+uv sync
+```
+
+### 環境變數 (`.env`)
+
+於專案根目錄建立 `.env`，可視需求覆寫以下變數（全部為選填，表列為預設值）：
+
+| 類別 | 變數 | 預設值 | 說明 |
+|------|------|--------|------|
+| Embedding | `EMBED_BASE_URL` | `http://127.0.0.1:8081/v1` | Embedding API 端點 |
+|  | `EMBED_API_KEY` | `no-key-required` | API Key |
+|  | `EMBED_MODEL` | `multilingual-e5-large-f16` | 模型名 |
+| LLM | `SUMMARY_BASE_URL` | `http://127.0.0.1:8080/v1` | Chat LLM 端點（摘要 / 抽取 / 合併共用） |
+|  | `SUMMARY_API_KEY` | `no-key-required` | API Key |
+|  | `SUMMARY_MODEL` | `gemma-4-E4B-it-Q4_K_M` | 模型名 |
+|  | `SUMMARY_TEMP` / `SUMMARY_TOP_P` / `SUMMARY_TOP_K` | `1.0` / `0.95` / `64` | 抽取階段取樣參數 |
+| Weaviate | `WEAVIATE_HOST` | `localhost` | 主機位址 |
+|  | `WEAVIATE_HTTP_PORT` / `WEAVIATE_HTTP_SECURE` | `8080` / `False` | HTTP port / 是否走 TLS |
+|  | `WEAVIATE_GRPC_PORT` / `WEAVIATE_GRPC_SECURE` | `50051` / `False` | gRPC port / 是否走 TLS |
+| 雙軌去重閘門 | `RAG_IDENTITY_STRONG` | `0.75` | Track A 名字軌強信號門檻 |
+|  | `RAG_IDENTITY_KEEP` | `0.62` | Track A 弱信號搭配字面共字才放行 |
+|  | `RAG_CONTENT_STRONG` | `0.35` | Track B 描述軌強信號門檻 |
+|  | `RAG_CONTENT_MIN` | `0.10` | Track B 配合字面共字才放行的最低門檻 |
+| QA Agent | `QA_MAX_CTX_TOKENS` | `65536` | LLM context 上限 (對齊 llama-server 啟動值) |
+|  | `QA_CTX_GATE` | `0.7` | 超過此比例觸發 Map-Reduce 篩選 |
+|  | `QA_MAX_ITER` | `20` | Tool calling 最大迭代次數 |
+|  | `QA_TEMP` / `QA_TOP_P` / `QA_TOP_K` | `1.0` / `0.95` / `64` | QA 階段取樣參數 |
+
+### 執行模式 (`main.py`)
+
+`main.py` 為統一進入點，透過 `--mode` 切換四種流程。
+
+| 參數 | 型別 | 預設 | 說明 |
+|------|------|------|------|
+| `--mode` | `ingest` / `process` / `all` / `qa` | `ingest` | 執行模式（見下表） |
+| `--novel` | str | `""` | 小說資料夾名稱；`ingest`/`process`/`all` 必填，`qa` 選填（作為偏好作品提示） |
+| `--start` | int | `1` | 起始集數 |
+| `--vol` | int | `0` | 只跑指定的單一集數（優先於 `--start`） |
+| `--clean` | flag | off | 清除該小說的全部輸出後重跑 |
+| `--prompt` | str | `""` | QA 模式一次性問題；留空則進入 REPL |
+| `--show-graph` | flag | off | QA 模式印出 LangGraph mermaid 圖 |
+| `--debug` | flag | off | QA 模式顯示 system prompt、tool 參數與原始檢索輸出 |
+
+模式對照：
+
+- `ingest`：Pre-processing，將原文切為 scene 分片並寫入 `output/<hash>/scenes/`。
+- `process`：知識抽取 Agent，跑 LCEL 五階段 pipeline，把 Scene 寫入 `NovelChunk` 並抽取 `NovelEntity`。
+- `all`：串跑 `ingest` + `process`。
+- `qa`：啟動 QA Agent，支援跨書系 (`scope=all novels`) 或指定作品 (`--novel`) 問答。
+
+### 典型工作流
+
+```bash
+# 1. 首次處理一本新小說 (從第 1 卷開始跑完整流程)
+uv run python main.py --mode all --novel death_march --start 1
+
+# 2. 補跑單一集 (例如只重處理第 5 卷)
+uv run python main.py --mode process --novel death_march --vol 5 --clean
+
+# 3. 啟動跨庫 QA REPL
+uv run python main.py --mode qa
+
+# 4. 一次性問答 (帶 debug 看 tool 呼叫細節)
+uv run python main.py --mode qa --prompt "聖槍是誰在用？" --debug
+```
 
 ---
 

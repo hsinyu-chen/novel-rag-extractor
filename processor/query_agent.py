@@ -4,12 +4,12 @@ from langchain_core.messages import (
     BaseMessage, SystemMessage, HumanMessage, AIMessage, ToolMessage
 )
 from langchain_core.tools import BaseTool
-from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from core.prompt_loader import load_prompt
+from processor.gemma_chat import GemmaThinkingChat
 
 
 class QAState(TypedDict):
@@ -57,27 +57,17 @@ class QueryAgent:
         self.ctx_gate = ctx_gate
         self.max_iter = max_iter
 
-        # llama-server 經 OpenAI-compatible 介面；強制 enable_thinking=True 以讓 Gemma 走 CoT
-        extra_body = {"chat_template_kwargs": {"enable_thinking": True}}
-        if top_k and top_k > 0:
-            extra_body["top_k"] = top_k
-        self.llm = ChatOpenAI(
+        # 直連 openai SDK（跟 llm_engine.py 同一套），確保 enable_thinking 生效
+        # 且把 Gemma 的 reasoning_content 透傳進 AIMessage.additional_kwargs。
+        self.llm = GemmaThinkingChat(
             base_url=base_url,
             api_key=api_key,
             model=model,
             temperature=temperature,
             top_p=top_p,
-            extra_body=extra_body,
+            top_k=top_k,
         )
         self.llm_with_tools = self.llm.bind_tools(tools)
-        self.llm_answer = ChatOpenAI(
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
-            temperature=temperature,
-            top_p=top_p,
-            extra_body=extra_body,
-        )
         self.graph = self._build_graph()
 
     # ---------- Token 估算 ----------
@@ -129,17 +119,49 @@ class QueryAgent:
         return {"notes": new_notes}
 
     def _answer_node(self, state: QAState) -> dict:
-        clean_msgs: List[BaseMessage] = [
-            SystemMessage(content=ANSWER_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"【使用者問題】\n{state['question']}\n\n"
-                    f"【資料庫查詢結果】\n" + "\n\n".join(state.get("notes") or ["（無查詢結果）"])
-                )
-            ),
-        ]
-        ai = self.llm_answer.invoke(clean_msgs)
-        return {"final_answer": ai.content or ""}
+        # 沿用 plan 階段的 messages（含原 system + 全部 tool 呼叫 / 結果），
+        # 僅在尾巴追加 Answer Mode 指令，最大化 llama-server KV-cache 前綴重用。
+        # 若 LLM 仍嘗試呼叫工具，以 ToolMessage 駁回後重試（最多 3 次）。
+        msgs: List[BaseMessage] = list(state["messages"])
+
+        # Edge case：token/iter 上限切換 answer 時，plan 的最後一則 AIMessage 可能還掛著
+        # 未執行的 tool_calls，屬於 OpenAI 無效狀態；補合成 ToolMessage 收尾。
+        last = msgs[-1] if msgs else None
+        if isinstance(last, AIMessage) and last.tool_calls:
+            for tc in last.tool_calls:
+                msgs.append(ToolMessage(
+                    tool_call_id=tc.get("id", ""),
+                    name=tc.get("name", ""),
+                    content="Answer Mode：已達 token/iteration 上限，本次檢索略過。",
+                ))
+
+        directive = ANSWER_SYSTEM + (
+            f"\n\n---\n【使用者原始問題】\n{state['question']}\n\n"
+            "請立刻依上述規則輸出對這個問題的最終答案文字，不要回覆「已切換模式」之類的確認語。"
+        )
+        msgs.append(HumanMessage(content=directive))
+
+        for attempt in range(3):
+            ai = self.llm_with_tools.invoke(msgs)
+            tool_calls = getattr(ai, "tool_calls", None) or []
+            if not tool_calls:
+                return {"final_answer": ai.content or ""}
+
+            # LLM 違反 Answer Mode，仍輸出 tool_calls → 合規駁回並要求直接回答
+            msgs.append(ai)
+            for tc in tool_calls:
+                msgs.append(ToolMessage(
+                    tool_call_id=tc.get("id", ""),
+                    name=tc.get("name", ""),
+                    content="Answer Mode：工具呼叫被拒。請勿再呼叫工具，直接輸出最終答案文字。",
+                ))
+            msgs.append(HumanMessage(content=(
+                f"上述工具呼叫已被系統駁回（Answer Mode 禁止呼叫工具，重試 {attempt + 1}/3）。"
+                f"請立刻改輸出針對原始問題「{state['question']}」的純文字答案，"
+                "不要再包含任何 tool_calls。"
+            )))
+
+        return {"final_answer": "(answer mode: LLM 反覆嘗試呼叫工具，已中止)"}
 
     # ---------- Routing ----------
     def _route_after_plan(self, state: QAState) -> Literal["tool", "answer"]:
