@@ -1,26 +1,8 @@
 import os
 import time
 import sys
-import warnings
-import subprocess
 from dotenv import load_dotenv
 from openai import OpenAI
-
-# 載入 .env
-load_dotenv()
-
-def get_vram_info():
-    """獲取 VRAM 使用狀況 (單位: MiB)"""
-    try:
-        # 使用 nvidia-smi 查詢
-        output = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.total,memory.used,memory.free", "--format=csv,noheader,nounits"],
-            encoding='utf-8'
-        )
-        total, used, free = map(str.strip, output.strip().split(','))
-        return f"{used}MiB / {free}MiB Free (Total {total}MiB)"
-    except Exception:
-        return "N/A"
 
 def check_weaviate():
     """測試 Weaviate 連線"""
